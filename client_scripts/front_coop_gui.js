@@ -1,13 +1,21 @@
 var fcPacketOnceRecent={}
+var fcUiOpenDelay=0
+function fcQueueOpen(){fcUiOpenDelay=2}
+ClientEvents.tick(event=>{
+ if(fcUiOpenDelay<=0)return
+ fcUiOpenDelay--
+ if(fcUiOpenDelay===0 && Client.player)GuiJS.open('front:coop')
+})
 function fcPacketOnce(channel,data){
  var now=Date.now(),key=channel+'|'+JSON.stringify(data)
  if(fcPacketOnceRecent[key]!==undefined && now-fcPacketOnceRecent[key]<150)return false
  fcPacketOnceRecent[key]=now
  for(var oldKey in fcPacketOnceRecent)if(now-fcPacketOnceRecent[oldKey]>5000)delete fcPacketOnceRecent[oldKey]
+ if(!Client.player)return false
  Client.player.sendData(channel,data)
  return true
 }
-function fcPageClick(page){return function(){fcUiPage=page;GuiJS.open('front:coop')}}
+function fcPageClick(page){return function(){fcUiPage=page;fcQueueOpen()}}
 var fcUiData={},fcUiPage='setup',fcUiName='',fcUiSide=2048,fcUiDir='north'
 var fcUiText={
  ru:{title:'НАСТРОЙКА КООПА',setup:'Территория',people:'Доступ',preview:'Предпросмотр',mode:'Режим ГМа',on:'ВКЛ',off:'ВЫКЛ',warA:'Зона БД: угол 1 здесь',warB:'Зона БД: угол 2 здесь',safeA:'Мирная зона: угол 1',safeB:'Мирная зона: угол 2',origin:'Очаг вторжения здесь',auto:'Создать вокруг меня',size:'Размер',direction:'Противник',clear:'Очистить черновик',arm:'Проверить и подтвердить',apply:'ПРИМЕНИТЬ',grant:'Назначить ГМом',revoke:'Отозвать права',name:'Ник игрока онлайн',denied:'Настраивает хост или назначенный ГМ',legend:'Схема: синий — война, зелёный — база, красный — очаг',north:'Север',south:'Юг',west:'Запад',east:'Восток',back:'Штаб',hint:'Применение заменит границы и поставит войну на паузу'},
@@ -15,7 +23,7 @@ var fcUiText={
  en:{title:'CO-OP SETUP',setup:'Territory',people:'Access',preview:'Preview',mode:'GM mode',on:'ON',off:'OFF',warA:'War area: corner 1 here',warB:'War area: corner 2 here',safeA:'Safe area: corner 1',safeB:'Safe area: corner 2',origin:'Enemy origin here',auto:'Generate around me',size:'Size',direction:'Enemy',clear:'Clear draft',arm:'Validate and confirm',apply:'APPLY',grant:'Appoint GM',revoke:'Revoke access',name:'Online player name',denied:'Only host or appointed GM may configure',legend:'Diagram: blue war, green base, red origin',north:'North',south:'South',west:'West',east:'East',back:'HQ',hint:'Apply replaces boundaries and pauses the war'}
 }
 function fcUiSend(action,extra){var data=extra||{};data.action=action;fcPacketOnce(action==='mode'?'front:gm_toggle':'front:coop_ui_request',data)}
-NetworkEvents.dataReceived('front:coop_data',event=>{fcUiData=event.data;fcUiData={language:event.data.getString('language'),active:event.data.getBoolean('active'),granted:event.data.getBoolean('granted'),owner:event.data.getBoolean('owner'),armed:event.data.getBoolean('armed'),paused:event.data.getBoolean('paused'),draft:event.data.getString('draft'),message:event.data.getString('message')};GuiJS.open('front:coop')})
+NetworkEvents.dataReceived('front:coop_data',event=>{fcUiData=event.data;fcUiData={language:event.data.getString('language'),active:event.data.getBoolean('active'),granted:event.data.getBoolean('granted'),owner:event.data.getBoolean('owner'),armed:event.data.getBoolean('armed'),paused:event.data.getBoolean('paused'),draft:event.data.getString('draft'),message:event.data.getString('message')};fcQueueOpen()})
 GUIEvents.createUI('front:coop',event=>{
  var t=fcUiText[String(fcUiData.language)]||fcUiText.ru,w=Math.min(400,Client.window.guiScaledWidth-8),h=Math.min(280,Client.window.guiScaledHeight-8)
  var x=Math.floor((Client.window.guiScaledWidth-w)/2),y=Math.floor((Client.window.guiScaledHeight-h)/2)
@@ -43,8 +51,8 @@ GUIEvents.createUI('front:coop',event=>{
   button(t.warA,12,80,184,'war_a');button(t.warB,204,80,184,'war_b')
   button(t.safeA,12,104,184,'safe_a');button(t.safeB,204,104,184,'safe_b')
   button(t.origin,12,128,376,'origin')
-  event.button(t.size+': '+fcUiSide,x+12,y+154,184,18).onClick(()=>{fcUiSide=fcUiSide===1024?2048:fcUiSide===2048?4096:1024;GuiJS.open('front:coop')})
-  event.button(t.direction+': '+t[fcUiDir],x+204,y+154,184,18).onClick(()=>{var dirs=['north','east','south','west'];fcUiDir=dirs[(dirs.indexOf(fcUiDir)+1)%4];GuiJS.open('front:coop')})
+  event.button(t.size+': '+fcUiSide,x+12,y+154,184,18).onClick(()=>{fcUiSide=fcUiSide===1024?2048:fcUiSide===2048?4096:1024;fcQueueOpen()})
+  event.button(t.direction+': '+t[fcUiDir],x+204,y+154,184,18).onClick(()=>{var dirs=['north','east','south','west'];fcUiDir=dirs[(dirs.indexOf(fcUiDir)+1)%4];fcQueueOpen()})
   event.button(t.auto,x+12,y+178,376,18).onClick(()=>fcUiSend('auto',{side:fcUiSide,direction:fcUiDir}))
   button(t.clear,12,202,376,'clear')
  }else{

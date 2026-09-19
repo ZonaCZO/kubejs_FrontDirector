@@ -1,4 +1,12 @@
 // Explicit NBT readers and responses. Existing front rules remain authoritative.
+var fuiRecent={}
+function fuiAllow(player,action){
+ var now=Date.now(),key=String(player.uuid)+'|'+String(action),last=Number(fuiRecent[key]||0)
+ if(now-last<150)return false
+ fuiRecent[key]=now
+ if(Object.keys(fuiRecent).length>256)for(var oldKey in fuiRecent)if(now-Number(fuiRecent[oldKey])>10000)delete fuiRecent[oldKey]
+ return true
+}
 function fuiText(data,key){return String(data.getString(key))}
 function fuiError(p,error){p.tell('[Штаб] '+String(error));console.warn('[HQ UI] '+String(error))}
 function fuiInit(server){if(!fdInitialized&&!fdInitialize(server))throw Error('Не удалось загрузить фронт.')}
@@ -29,7 +37,7 @@ NetworkEvents.dataReceived('front:hq_ui_request',event=>{
    p.tell('[Штаб] Название противника сохранено.')
   }else throw Error('Неизвестное действие: '+a)
   fuiHq(p)
- }catch(error){fuiError(p,error)}
+ }catch(error){fuiError(p,error);try{fuiHq(p)}catch(ignored){}}
 })
 NetworkEvents.dataReceived('front:services_ui_request',event=>{
  var p=event.player,s=p.server,d=event.data,a=fuiText(d,'action'),tab=fuiText(d,'tab')||a
@@ -54,7 +62,7 @@ NetworkEvents.dataReceived('front:services_ui_request',event=>{
   else if(['mail','profile','missions'].indexOf(a)<0)throw Error('Неизвестное действие: '+a)
   if(['mail','profile','missions'].indexOf(tab)<0)tab='mail'
   fwSend(s,p,tab)
- }catch(error){fuiError(p,error)}
+ }catch(error){fuiError(p,error);try{fwSend(s,p,tab)}catch(ignored){}}
 })
 NetworkEvents.dataReceived('front:admin_ui_request',event=>{
  var p=event.player,s=p.server,a=fuiText(event.data,'action')
@@ -62,8 +70,8 @@ NetworkEvents.dataReceived('front:admin_ui_request',event=>{
   if(!fcCanEdit(p))throw Error('Нет активного режима ГМа.')
   fuiInit(s)
   var now=fdGameTime(s)
-  if(Number(p.persistentData.getLong('front_ui_next_'+a))>now)return // Duplicate UI request: ignore silently.
-  p.persistentData.putLong('front_ui_next_'+a,now+2)
+  // Runtime-only debounce cannot become permanently stuck in world NBT.
+  if(!fuiAllow(p,a))return
   if(a==='pause_toggle'){
    var paused=!s.persistentData.getBoolean('front_gm_paused')
    s.persistentData.putBoolean('front_gm_paused',paused)
@@ -103,5 +111,5 @@ NetworkEvents.dataReceived('front:admin_ui_request',event=>{
    fdResetWar({source:{server:s,player:p}})
   }else throw Error('Неизвестное действие: '+a)
   fuiHq(p)
- }catch(error){fuiError(p,error)}
+ }catch(error){fuiError(p,error);try{fuiHq(p)}catch(ignored){}}
 })

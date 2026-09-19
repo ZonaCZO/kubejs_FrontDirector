@@ -1,11 +1,18 @@
+var fcuiRecent={}
+function fcuiAllow(player,action){
+  var now=Date.now(),key=String(player.uuid)+'|'+String(action),last=Number(fcuiRecent[key]||0)
+  if(now-last<150)return false
+  fcuiRecent[key]=now
+  if(Object.keys(fcuiRecent).length>256)for(var oldKey in fcuiRecent)if(now-Number(fcuiRecent[oldKey])>10000)delete fcuiRecent[oldKey]
+  return true
+}
 NetworkEvents.dataReceived('front:coop_ui_request',event=>{
   var player=event.player,server=player.server,action=(String(event.data.getString('action'))||'view'),message=''
   try {
     if(action==='view'){fcSend(player);return}
     if(!fcGranted(player))throw new Error('Only the host, an operator or appointed GM can configure war.')
     var now=fdGameTime(server)
-    if(Number(player.persistentData.getLong('front_coop_ui_next_'+action))>now)return // Duplicate UI request: ignore silently.
-    player.persistentData.putLong('front_coop_ui_next_'+action,now+2)
+    if(!fcuiAllow(player,action))return
     if(action==='mode') {
       player.persistentData.putBoolean('front_coop_gm_mode',!player.persistentData.getBoolean('front_coop_gm_mode'))
       player.persistentData.putLong('front_coop_confirm',0)
@@ -80,5 +87,5 @@ NetworkEvents.dataReceived('front:coop_ui_request',event=>{
       }
     }
     fcSend(player,message)
-  } catch(error) {player.tell('[Штаб] '+String(error));fcSend(player,String(error).slice(0,180))}
+  } catch(error) {console.warn('[Co-op UI] '+String(error));player.tell('[Штаб] '+String(error));fcSend(player,String(error).slice(0,180))}
 })

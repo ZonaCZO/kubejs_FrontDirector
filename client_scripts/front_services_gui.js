@@ -1,9 +1,17 @@
 var fsPacketOnceRecent={}
+var fsUiOpenDelay=0
+function fsQueueOpen(){fsUiOpenDelay=2}
+ClientEvents.tick(event=>{
+ if(fsUiOpenDelay<=0)return
+ fsUiOpenDelay--
+ if(fsUiOpenDelay===0 && Client.player)GuiJS.open('front:services')
+})
 function fsPacketOnce(channel,data){
  var now=Date.now(),key=channel+'|'+JSON.stringify(data)
  if(fsPacketOnceRecent[key]!==undefined && now-fsPacketOnceRecent[key]<150)return false
  fsPacketOnceRecent[key]=now
  for(var oldKey in fsPacketOnceRecent)if(now-fsPacketOnceRecent[oldKey]>5000)delete fsPacketOnceRecent[oldKey]
+ if(!Client.player)return false
  Client.player.sendData(channel,data)
  return true
 }
@@ -23,7 +31,7 @@ NetworkEvents.dataReceived('front:services_data',event=>{
  var mail=d.getList('mail',10);fsData.mail=[];
  for(var i=0;i<mail.size();i++){var m=mail.getCompound(i);fsData.mail.push({zone:String(m.getString('zone')),kind:String(m.getString('kind')),tick:m.getDouble('tick'),count:m.getDouble('count')})}
 fsRole=String(fsData.role || '');fsCallsign=String(fsData.callsign || '');fsFlag=String(fsData.flag || '')
- GuiJS.open('front:services')
+ fsQueueOpen()
 })
 GUIEvents.createUI('front:services',event=>{
  var t=fsText[String(fsData.language)] || fsText.ru,tab=String(fsData.tab),w=320,h=246

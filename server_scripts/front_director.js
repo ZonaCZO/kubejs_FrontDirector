@@ -3,6 +3,7 @@
 
 var FD_BlockPos = Java.loadClass('net.minecraft.core.BlockPos')
 var FD_Heightmap = Java.loadClass('net.minecraft.world.level.levelgen.Heightmap$Types')
+var FD_BiomeTags = Java.loadClass('net.minecraft.tags.BiomeTags')
 var FD_LostCities = Java.loadClass('mcjty.lostcities.LostCities')
 
 var FD_CONFIG = 'kubejs/config/front_director_v3.json'
@@ -60,8 +61,7 @@ NetworkEvents.dataReceived('front:coop_request',event=>{
     if(action==='view'){fcSend(player);return}
     if(!fcGranted(player))throw new Error('Only the host, an operator or appointed GM can configure war.')
     var now=fdGameTime(server)
-    if(Number(player.persistentData.getLong('front_coop_next'))>now)return
-    player.persistentData.putLong('front_coop_next',now+10)
+    if(typeof fcuiAllow==='function' && !fcuiAllow(player,'legacy_'+action))return
     if(action==='mode') {
       player.persistentData.putBoolean('front_coop_gm_mode',!player.persistentData.getBoolean('front_coop_gm_mode'))
       player.persistentData.putLong('front_coop_confirm',0)
@@ -252,6 +252,30 @@ function fdLoadConfig(server) {
   var major=Number(fdConfig.sectorSize),small=fdZoneSize()
   if(!isFinite(major) || !isFinite(small) || small<32 || major%small!==0 || major/small>8)
     throw new Error('frontZoneSize must divide sectorSize, minimum 32 and maximum 8 zones per side')
+  var requiredLists=['warAreas','safeZones','origins','robotEntities','alliedEntities']
+  for(var l=0;l<requiredLists.length;l++) {
+    var list=fdConfig[requiredLists[l]]
+    if(list==null || typeof list.length==='undefined')throw new Error('Invalid '+requiredLists[l]+' list')
+  }
+  if(fdConfig.warAreas.length===0)throw new Error('At least one war area is required')
+  if(fdConfig.origins.length===0)throw new Error('At least one invasion origin is required')
+  if(fdConfig.robotEntities.length===0)throw new Error('robotEntities cannot be empty')
+  var numericRules={
+    expansionIntervalMinutes:[0.05,1440],sectorsAdvancedPerCycle:[1,128],
+    expansionControlGain:[0,100],expansionSourceControl:[1,100],activeRadiusSectors:[0,8],
+    absoluteRobotCapPerSector:[1,256],minimumSurfaceY:[-64,320],maximumSurfaceY:[-63,384]
+  }
+  Object.keys(numericRules).forEach(name=>{
+    var value=Number(fdConfig[name]),range=numericRules[name]
+    if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
+  })
+  if(Number(fdConfig.minimumSurfaceY)>=Number(fdConfig.maximumSurfaceY))throw new Error('minimumSurfaceY must be lower than maximumSurfaceY')
+  var rectLists=['warAreas','safeZones']
+  for(var r=0;r<rectLists.length;r++)for(var i=0;i<fdConfig[rectLists[r]].length;i++) {
+    var rect=fdConfig[rectLists[r]][i]
+    for(var f=0;f<4;f++)if(!isFinite(Number(rect[['x1','z1','x2','z2'][f]])))throw new Error('Invalid coordinate in '+rectLists[r])
+  }
+  for(var o=0;o<fdConfig.origins.length;o++)if(!isFinite(Number(fdConfig.origins[o].x))||!isFinite(Number(fdConfig.origins[o].z)))throw new Error('Invalid invasion origin')
 }
 
 function fdWorld(server) {
@@ -265,8 +289,20 @@ function fdOptionNumber(name, fallback) {
   return fdConfig[name] == null ? fallback : Number(fdConfig[name])
 }
 
+var fdLastGameTime = 0
+var fdGameTimeWarningShown = false
 function fdGameTime(server) {
-  try { return Number(fdWorld(server).getGameTime()) } catch (ignored) { return 0 }
+  try {
+    var value=Number(fdWorld(server).getGameTime())
+    if(isFinite(value)){fdLastGameTime=value;return value}
+  } catch (firstError) {
+    try {
+      var fallback=Number(fdWorld(server).getDayTime())
+      if(isFinite(fallback)){fdLastGameTime=fallback;return fallback}
+    } catch (secondError) {}
+    if(!fdGameTimeWarningShown){console.warn('[Front Director] Cannot read world game time: '+firstError);fdGameTimeWarningShown=true}
+  }
+  return fdLastGameTime
 }
 
 function fdOpsLoad(server) {
@@ -363,15 +399,23 @@ function fdAllowedSector(sx, sz) {
   return fdInWarArea(c.x, c.z) && !fdInSafeZone(c.x, c.z)
 }
 
-function fdBiomeIdAtLoaded(level, x, z) {
-  if (!level.getChunkSource().hasChunk(x >> 4, z >> 4)) return ''
+function fdBiomeInfoAtLoaded(level, x, z) {
+  if (!level.getChunkSource().hasChunk(x >> 4, z >> 4)) return null
   try {
     var y = level.getHeight(FD_Heightmap.MOTION_BLOCKING_NO_LEAVES, x, z)
     var holder = level.getBiome(new FD_BlockPos(x, y, z))
     var key = holder.unwrapKey()
-    if (key.isPresent()) return String(key.get().location())
+    var id=key.isPresent()?String(key.get().location()):''
+    var ocean=false
+    try{ocean=holder.is(FD_BiomeTags.IS_OCEAN)}catch(ignored){}
+    return {id:id,ocean:ocean||id.indexOf('ocean')>=0}
   } catch (ignored) {}
-  return ''
+  return null
+}
+
+function fdBiomeIdAtLoaded(level, x, z) {
+  var info=fdBiomeInfoAtLoaded(level,x,z)
+  return info?info.id:''
 }
 
 function fdSectorTerrain(level, sx, sz) {
@@ -386,18 +430,19 @@ function fdSectorTerrain(level, sx, sz) {
   var oceans = 0
   var known = 0
   for (var i = 0; i < points.length; i++) {
-    var id = fdBiomeIdAtLoaded(level,
+    var info = fdBiomeInfoAtLoaded(level,
       Math.floor(startX + size * points[i][0]),
       Math.floor(startZ + size * points[i][1]))
-    if (!id) continue
+    if (!info) continue
+    var id=info.id
     known++
     if (id.indexOf('peak') >= 0 || id.indexOf('mountain') >= 0) peaks++
     if (id.indexOf('river') >= 0) rivers++
-    if (id.indexOf('ocean') >= 0) oceans++
+    if (info.ocean) oceans++
   }
   // Unknown/unloaded terrain never forces chunk generation on the server thread.
   var result = { name: 'обычная местность', factor: 1.0 }
-  if (known >= 3 && oceans / known >= 0.6) result = { name: 'океан', factor: 0, ocean: true }
+  if (oceans > 0 && oceans / known >= 0.5) result = { name: 'океан', factor: 0, ocean: true }
   else if (rivers > 0) result = { name: 'река', factor: Math.min(0.05,fdOptionNumber('riverExpansionFactor', 0.05)) }
   else if (peaks > 0) result = { name: 'горы', factor: fdOptionNumber('peakExpansionFactor', 0.35) }
   if (known === points.length) fdTerrainCache[key] = result
@@ -489,8 +534,8 @@ function fdRebuildSupply() {
     queue.push({sx: sx, sz: sz})
   }
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
-  while (queue.length > 0) {
-    var current = queue.shift()
+  for(var q=0;q<queue.length;q++) {
+    var current = queue[q]
     for (var d = 0; d < dirs.length; d++) {
       var nx = current.sx + dirs[d][0]
       var nz = current.sz + dirs[d][1]
@@ -1662,9 +1707,8 @@ NetworkEvents.dataReceived('front:admin_request',event=>{
   if(!fcCanEdit(player))return
   if(!fdInitialized && !fdInitialize(server))return
   var now=fdGameTime(server)
-  if(Number(player.persistentData.getLong('front_admin_next'))>now)return
-  player.persistentData.putLong('front_admin_next',now+10)
   var action=String(event.data.action || '')
+  if(typeof fuiAllow==='function' && !fuiAllow(player,'legacy_'+action))return
   if(action==='pause_toggle')server.persistentData.putBoolean('front_gm_paused',!server.persistentData.getBoolean('front_gm_paused'))
   else if(action==='control_plus' || action==='control_minus'){
     var sx=fdSX(player.x),sz=fdSZ(player.z)

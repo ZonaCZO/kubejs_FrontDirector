@@ -8,5 +8,5 @@ ClientEvents.tick(event=>{
   // Drain queued presses even while menus are open, so closing chat cannot open HQ.
   if(!pressed || !Client.player || Client.screen!=null || frontHqKeyCooldown>0)return
   frontHqKeyCooldown=10
-  Client.player.sendData('front:hq_request',{action:'refresh'})
+  Client.player.sendData('front:hq_ui_request',{action:'refresh'})
 })

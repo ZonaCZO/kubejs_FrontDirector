@@ -1,9 +1,17 @@
 var hqPacketOnceRecent={}
+var frontHqOpenDelay=0
+function frontQueueHqOpen(){frontHqOpenDelay=2}
+ClientEvents.tick(event=>{
+ if(frontHqOpenDelay<=0)return
+ frontHqOpenDelay--
+ if(frontHqOpenDelay===0 && Client.player)GuiJS.open('front:headquarters')
+})
 function hqPacketOnce(channel,data){
  var now=Date.now(),key=channel+'|'+JSON.stringify(data)
  if(hqPacketOnceRecent[key]!==undefined && now-hqPacketOnceRecent[key]<150)return false
  hqPacketOnceRecent[key]=now
  for(var oldKey in hqPacketOnceRecent)if(now-hqPacketOnceRecent[oldKey]>5000)delete hqPacketOnceRecent[oldKey]
+ if(!Client.player)return false
  Client.player.sendData(channel,data)
  return true
 }
@@ -16,7 +24,7 @@ var frontTexts={
 }
 function frontHqSend(action){hqPacketOnce('front:hq_ui_request',{action:action})}
 function frontAdminSend(action){hqPacketOnce('front:admin_ui_request',{action:action})}
-function frontSelectTab(tab){frontHqTab=tab;frontResetConfirm=false;GuiJS.open('front:headquarters')}
+function frontSelectTab(tab){frontHqTab=tab;frontResetConfirm=false;frontQueueHqOpen()}
 NetworkEvents.dataReceived('front:hq_data',event=>{
  var d=event.data;frontHqData={};
  for(var key of ['stateName','enemyName','language','sector','zoneCode'])frontHqData[key]=String(d.getString(key));
@@ -25,7 +33,7 @@ NetworkEvents.dataReceived('front:hq_data',event=>{
  frontResetConfirm=frontHqData.resetArmed;
 frontHqNameInput=String(frontHqData.stateName);frontEnemyInput=String(frontHqData.enemyName)
  if(!frontHqData.canEdit && (frontHqTab==='gm' || frontHqTab==='cheats'))frontHqTab='overview'
- GuiJS.open('front:headquarters')
+ frontQueueHqOpen()
 })
 GUIEvents.createUI('front:headquarters',event=>{
  var t=frontTexts[String(frontHqData.language)] || frontTexts.ru,w=320,h=220
