@@ -1105,6 +1105,7 @@ function fdHqPayload(server, player) {
   return {
     role: String(player.persistentData.getString('front_rp_role') || ''),
     warPaused:server.persistentData.getBoolean('front_gm_paused'),
+    warPace:fdWarPace(server),
     callsign: String(player.persistentData.getString('front_rp_callsign') || ''),
     flag: String(player.persistentData.getString('front_rp_flag') || ''),
     enemyName: fdEnemyName(server), language: String(player.persistentData.getString('front_language') || 'ru'),
@@ -1117,6 +1118,21 @@ function fdHqPayload(server, player) {
     garrisonStrength: garrison ? Number(garrison.strength) : 0,
     garrisonMax: garrison ? Number(garrison.maxStrength) : 0
   }
+}
+
+// Persistent GM pacing changes strategic expansion only. Combat AI, spawning,
+// casualties and player counterattacks continue at their normal rate.
+function fdWarPace(server) {
+  if(!server.persistentData.getBoolean('front_pace_initialized')) {
+    server.persistentData.putBoolean('front_pace_initialized',true)
+    server.persistentData.putInt('front_war_pace',100)
+  }
+  var pace=Number(server.persistentData.getInt('front_war_pace'))
+  return [0,35,100,200,400].indexOf(pace)>=0?pace:100
+}
+function fdSetWarPace(server,pace) {
+  server.persistentData.putBoolean('front_pace_initialized',true)
+  server.persistentData.putInt('front_war_pace',Number(pace))
 }
 
 function fdOpenHq(server, player) {
@@ -1447,7 +1463,9 @@ ServerEvents.tick(event => {
   if (fdTick % FD_CHECK_TICKS !== 0) return
 
   var server = event.server
-  fdExpansionClock -= FD_CHECK_TICKS
+  // 0% freezes strategic borders without freezing battles. Other presets
+  // consume the expansion clock proportionally and persist with the world.
+  fdExpansionClock -= FD_CHECK_TICKS * fdWarPace(event.server) / 100
   if (fdExpansionClock <= 0) {
     fdStrategicExpansion(server)
     fdExpansionClock = Number(fdConfig.expansionIntervalMinutes) * 60 * 20

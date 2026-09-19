@@ -68,6 +68,18 @@ NetworkEvents.dataReceived('front:admin_ui_request',event=>{
    var paused=!s.persistentData.getBoolean('front_gm_paused')
    s.persistentData.putBoolean('front_gm_paused',paused)
    p.tell('[Штаб] '+(paused?'Война на паузе.':'Война продолжена.'))
+  }else if(a==='pace_cycle'||a==='pace_up'||a==='pace_down'){
+   var paces=[0,35,100,200,400],current=fdWarPace(s),index=paces.indexOf(current)
+   if(index<0)index=paces.indexOf(100)
+   var direction=a==='pace_down'?-1:1
+   var next=paces[(index+direction+paces.length)%paces.length]
+   fdSetWarPace(s,next)
+   p.tell('[Штаб] Темп стратегического наступления: '+next+'%.')
+  }else if(a==='advance_now'){
+   if(s.persistentData.getBoolean('front_gm_paused'))throw Error('Сначала продолжи войну: на полной паузе ход противника недоступен.')
+   fdStrategicExpansion(s)
+   fdExpansionClock=Number(fdConfig.expansionIntervalMinutes)*60*20
+   p.tell('[Штаб] Выполнен один стратегический ход противника.')
   }else if(a==='control_plus'||a==='control_minus'){
    var sx=fdSX(p.x),sz=fdSZ(p.z)
    if(String(p.level.dimension)!=='minecraft:overworld'||!fdAllowedSector(sx,sz))throw Error('Встань в доступную боевую зону, не в безопасную территорию.')

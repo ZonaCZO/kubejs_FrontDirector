@@ -2,12 +2,14 @@
 var FM_Pos = Java.loadClass('net.minecraft.core.BlockPos')
 var FM_Height = Java.loadClass('net.minecraft.world.level.levelgen.Heightmap$Types')
 var FM_Registry = Java.loadClass('net.minecraft.core.registries.BuiltInRegistries')
+var FM_BiomeTags = Java.loadClass('net.minecraft.tags.BiomeTags')
 var fmClock = 0
+var FM_SURVEY_PER_SECOND = 8
 var fmCells = []
 var fmCursor = 0
 var fmTerrain = {}
 var fmLoaded = false
-var FM_TERRAIN_VERSION = 2
+var FM_TERRAIN_VERSION = 3
 var fmMetadata = null
 var fmSignature = ''
 
@@ -19,7 +21,7 @@ function fmPrepare(server) {
   if (!fmLoaded) {
     try { fmTerrain = JSON.parse(String(server.persistentData.getString('front_cc_terrain')) || '{}') } catch (fmError) { fmTerrain = {} }
     fmLoaded = true
-    // Old samples did not distinguish ocean from lakes. Re-survey loaded chunks.
+    // Re-survey when biome classification changes.
     if(Number(server.persistentData.getInt('front_cc_terrain_version'))!==FM_TERRAIN_VERSION) fmTerrain={}
     server.persistentData.putInt('front_cc_terrain_version',FM_TERRAIN_VERSION)
   }
@@ -63,11 +65,18 @@ function fmSurvey(level, cell) {
     if (!level.getChunkSource().hasChunk(x>>4,z>>4)) continue
     var y = level.getHeight(FM_Height.MOTION_BLOCKING_NO_LEAVES,x,z)
     var pos = new FM_Pos(x,y-1,z)
-    var biome = level.getBiome(pos).unwrapKey()
+    var biomeHolder = level.getBiome(pos)
+    var biome = biomeHolder.unwrapKey()
     var id = biome.isPresent() ? String(biome.get().location()) : ''
     var water = String(FM_Registry.BLOCK.getKey(level.getBlockState(pos).getBlock())) === 'minecraft:water'
+    // The biome tag covers vanilla, deep/frozen oceans and modded oceans such as
+    // correctly tagged Terralith biomes. The name check is a fallback for a mod
+    // that forgot to add its ocean biome to the standard tag.
+    var taggedOcean = false
+    try { taggedOcean = biomeHolder.is(FM_BiomeTags.IS_OCEAN) } catch (fmOceanTagError) {}
+    var oceanBiome = taggedOcean || id.indexOf('ocean') >= 0
     record.samples[String(p)] = {water:water || id.indexOf('ocean')>=0 || id.indexOf('river')>=0,
-      ocean:id.indexOf('ocean')>=0,
+      ocean:oceanBiome,
       river:id.indexOf('river')>=0, mountain:id.indexOf('peak')>=0 || id.indexOf('mountain')>=0,
       forest:id.indexOf('forest')>=0 || id.indexOf('taiga')>=0, y:y}
   }
@@ -86,7 +95,9 @@ function fmSurvey(level, cell) {
   record.known=keys.length
   record.water_fraction=wet/keys.length
   record.ocean_fraction=ocean/keys.length
-  record.ocean=keys.length>=3 && ocean/keys.length>=0.6
+  // Classify immediately from the probes that are actually available. Previously
+  // three probes were required, so partly loaded ocean sectors stayed green.
+  record.ocean=ocean>0 && ocean/keys.length>=0.5
   record.river=river>0
   record.mountain=mountain>0
   record.terrain=record.ocean?'ocean':(river>0?'river':(wet/keys.length>=0.5?'water':(mountain>0?'mountain':(forest>0?'forest':'land'))))
@@ -102,8 +113,12 @@ ServerEvents.tick(event => {
     if (!fmPrepare(mapServer)) return
   }
   if(fmCells.length) {
-    fmSurvey(mapServer.overworld(),fmCells[fmCursor%fmCells.length])
-    fmCursor++
+    // Loaded-chunk checks are cheap and never generate terrain. A small batch
+    // makes explored coastlines appear on the map without a long full-map wait.
+    for (var scan=0;scan<FM_SURVEY_PER_SECOND;scan++) {
+      fmSurvey(mapServer.overworld(),fmCells[fmCursor%fmCells.length])
+      fmCursor++
+    }
   }
   if(fmClock%400!==0) return
   var encodedSnapshot=global.frontMapBuild(mapServer)
