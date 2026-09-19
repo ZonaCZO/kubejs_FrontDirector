@@ -159,6 +159,7 @@ var fdEntityScanTick = -999999
 var fdCombatCursor = 0
 var fdTerrainCache = {}
 var fdSupplyCache = {}
+var fdSettlementCivilians = {}
 var fdOps = { liberated: {}, protection: {}, garrisons: {}, alerts: {} }
 var fdOpsDirty = false
 var fdMapConfigWarning = ''
@@ -267,6 +268,12 @@ function fdLoadConfig(server) {
   }
   Object.keys(numericRules).forEach(name=>{
     var value=Number(fdConfig[name]),range=numericRules[name]
+    if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
+  })
+  var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64]}
+  Object.keys(optionalNumericRules).forEach(name=>{
+    if(fdConfig[name]==null)return
+    var value=Number(fdConfig[name]),range=optionalNumericRules[name]
     if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
   })
   if(Number(fdConfig.minimumSurfaceY)>=Number(fdConfig.maximumSurfaceY))throw new Error('minimumSurfaceY must be lower than maximumSurfaceY')
@@ -686,6 +693,14 @@ function fdIsDefenderEntity(entity) {
   return id.indexOf('simpleenemymod:') === 0
 }
 
+function fdIsCivilianEntity(entity) {
+  var id=fdEntityId(entity)
+  var types=fdConfig.settlementCivilianEntities || ['minecraft:villager','slimpatch:male_villager','slimpatch:female_villager']
+  for(var i=0;i<types.length;i++)if(id===String(types[i]))return true
+  try { if(String(entity.getClass().getName()).indexOf('com.javic.slimpatch.entity.')===0)return true } catch(ignored) {}
+  return false
+}
+
 function fdDistanceSq(a, b) {
   var dx = a.x - b.x
   var dy = a.y - b.y
@@ -744,12 +759,17 @@ function fdCombatNetwork(server) {
   if (fdCombatTick - fdEntityScanTick >= FD_ENTITY_SCAN_INTERVAL) {
     fdTrackedRobots = []
     fdTrackedSem = []
+    fdSettlementCivilians = {}
     var iterator = level.getAllEntities().iterator()
     fwScanBegin()
     while (iterator.hasNext()) {
       var scannedEntity = iterator.next()
       if (!scannedEntity.isAlive()) continue
       fwScanEntity(scannedEntity)
+      if (fdIsCivilianEntity(scannedEntity)) {
+        var civilianKey=fdMajorKey(fdSX(scannedEntity.x),fdSZ(scannedEntity.z))
+        fdSettlementCivilians[civilianKey]=Number(fdSettlementCivilians[civilianKey] || 0)+1
+      }
       if (fdIsRobot(scannedEntity) && scannedEntity.getTags().contains('fd_robot')) fdTrackedRobots.push(scannedEntity)
       else if (fdEntityId(scannedEntity).indexOf('simpleenemymod:') === 0) fdTrackedSem.push(scannedEntity)
     }
@@ -877,6 +897,11 @@ function fdIsCitySector(level, sx, sz) {
     fdCityCache[key] = false
   }
   return fdCityCache[key]
+}
+
+function fdIsSettlementSector(level,sx,sz) {
+  if(fdIsCitySector(level,sx,sz))return true
+  return Number(fdSettlementCivilians[fdMajorKey(sx,sz)] || 0)>=fdOptionNumber('settlementCivilianMinimum',3)
 }
 
 function fdSpawnRobot(server, level, sx, sz, anchor, forcedType) {
@@ -1349,6 +1374,7 @@ function fdResetWar(context) {
   fdOpsDirty = true
   fdTrackedRobots = []
   fdTrackedSem = []
+  fdSettlementCivilians = {}
   fdCombatCursor = 0
   fdEntityScanTick = fdCombatTick
   fdSharedIntel = null
@@ -1403,9 +1429,9 @@ function fdUpdateLocalFront(server) {
   Object.keys(active).forEach(key => {
     var activeSector = active[key]
     var parentKey=fdMajorKey(activeSector.sx,activeSector.sz)
+    var parentPair=parentKey.split(','),majorSize=Number(fdConfig.sectorSize)
     if(parentCounts[parentKey]==null) {
-      var pair=parentKey.split(','),size=Number(fdConfig.sectorSize)
-      parentCounts[parentKey]=fdCount(server,`@e[tag=fd_robot,x=${Number(pair[0])*size},y=-64,z=${Number(pair[1])*size},dx=${size-1},dy=384,dz=${size-1}]`)
+      parentCounts[parentKey]=fdCount(server,`@e[tag=fd_robot,x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}]`)
     }
     var control = fdControl(activeSector.sx, activeSector.sz)
     var frontSector = fdIsFrontier(activeSector.sx, activeSector.sz)
@@ -1426,25 +1452,35 @@ function fdUpdateLocalFront(server) {
 
     var strength = fdStrength(activeSector.sx, activeSector.sz)
     var citySector = fdIsCitySector(level, activeSector.sx, activeSector.sz)
+    var settlementSector = citySector || fdIsSettlementSector(level, activeSector.sx, activeSector.sz)
+    var mortarSuppressed = fwMissionEffect(server, fdKey(activeSector.sx,activeSector.sz), 'mortar')
+    var requiredMortars = frontSector && settlementSector && !mortarSuppressed ? Math.floor(fdOptionNumber('siegeMortarMinimum',1)) : 0
+    var mortarCount = requiredMortars > 0 ? fdCount(server,`@e[type=crusty_chunks:mortarer,tag=fd_robot,x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}]`) : 0
+    var missingSiegeMortars = Math.max(0,requiredMortars-mortarCount)
     var cityMultiplier = citySector ? fdOptionNumber('cityRobotMultiplier', 1.8) : 1.0
     var resistanceBonus = Math.min(Number(fdConfig.resistanceCap), defenders) * Number(fdConfig.extraRobotsPerDefender)
     var frontBaseCap = fdOptionNumber('frontRobotCapPerSector', fdConfig.baseRobotCapPerSector)
     var rearBaseCap = fdOptionNumber('rearGarrisonCapPerSector', 8)
     var selectedBaseCap = frontSector ? frontBaseCap : rearBaseCap
-    var cap = Math.min(Number(fdConfig.absoluteRobotCapPerSector),
+    var absoluteCap=Number(fdConfig.absoluteRobotCapPerSector)
+    var cap = Math.min(absoluteCap+missingSiegeMortars,
       Math.round(selectedBaseCap * strength * cityMultiplier + (frontSector ? resistanceBonus : 0)))
+    if(missingSiegeMortars>0)cap=Math.max(cap,Math.min(robots+missingSiegeMortars,absoluteCap+missingSiegeMortars))
 
     if (robots >= cap) return
     var selectedBatch = frontSector ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) : fdOptionNumber('rearSpawnBatch', 2)
     var wave = Math.min(selectedBatch, cap - robots,
-      Math.max(0,Number(fdConfig.absoluteRobotCapPerSector)-parentCounts[parentKey]))
+      Math.max(0,absoluteCap+missingSiegeMortars-parentCounts[parentKey]))
     if(wave<=0) return
     var squadAnchor = null
     var rarePresent = fdCount(server, `@e[tag=fd_rare_support,${fdSectorBox(activeSector.sx, activeSector.sz)}]`) > 0
     for (var i = 0; i < wave; i++) {
       var forcedType = fdInfantryType()
       var rareSupport = false
-      if (i === 0 && wave >= fdOptionNumber('squadLeaderMinimumSize', 5) &&
+      var guaranteedMortar=missingSiegeMortars>0
+      if (guaranteedMortar) {
+        forcedType = 'crusty_chunks:mortarer'
+      } else if (i === 0 && wave >= fdOptionNumber('squadLeaderMinimumSize', 5) &&
           Math.random() < fdOptionNumber('squadLeaderChance', 0.35)) {
         var leaders = fdConfig.squadLeaderEntities || ['crusty_chunks:commander', 'crusty_chunks:scout']
         forcedType = String(leaders[Math.floor(Math.random() * leaders.length)])
@@ -1458,7 +1494,10 @@ function fdUpdateLocalFront(server) {
         forcedType = fdSupportType()
       }
       var spawnedAt = fdSpawnRobot(server, level, activeSector.sx, activeSector.sz, squadAnchor, forcedType)
-      if(spawnedAt) parentCounts[parentKey]++
+      if(spawnedAt) {
+        parentCounts[parentKey]++
+        if(guaranteedMortar)missingSiegeMortars--
+      }
       if (rareSupport && spawnedAt) {
         fdCmd(server, `tag @e[type=${forcedType},tag=fd_robot,sort=nearest,limit=1,x=${spawnedAt.x},z=${spawnedAt.z},distance=..24] add fd_rare_support`)
       }
