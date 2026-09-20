@@ -426,6 +426,20 @@ function fdBiomeInfoAtLoaded(level, x, z) {
   return null
 }
 
+function fdRoleInfantryType(role) {
+  if (role === 'sweep') return fdRandomFrom(fdConfig.sweepEntities, fdRandomFrom([
+    'crusty_chunks:striker','crusty_chunks:rifler','crusty_chunks:breacher',
+    'crusty_chunks:scout','crusty_chunks:assassin'
+  ],'crusty_chunks:striker'))
+  if (role === 'gendarmerie') return fdRandomFrom(fdConfig.gendarmerieEntities, fdRandomFrom([
+    'crusty_chunks:striker','crusty_chunks:rifler','crusty_chunks:worker','crusty_chunks:scout'
+  ],'crusty_chunks:striker'))
+  return fdRandomFrom(fdConfig.assaultEntities, fdRandomFrom([
+    'crusty_chunks:striker','crusty_chunks:striker','crusty_chunks:rifler',
+    'crusty_chunks:rifler','crusty_chunks:worker','crusty_chunks:breacher'
+  ],'crusty_chunks:striker'))
+}
+
 function fdHeavyArmorEntities() {
   return fdConfig.heavyArmorEntities || ['crusty_chunks:decimator_hull','crusty_chunks:prototype_hull','crusty_chunks:eradicator_hull']
 }
@@ -863,15 +877,92 @@ function fdAiActive(level,robot) {
 
 function fdMobileFrontUnit(robot) {
   var id=fdEntityId(robot)
-  return id!==String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') && id!=='crusty_chunks:mortarer'
+  // Warium aircraft have their own flight controller. Giving them a ground
+  // navigation target every few seconds makes some versions orbit forever.
+  return !fdIsAircraftType(id) && id!==String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') && id!=='crusty_chunks:mortarer'
+}
+
+function fdRobotRole(robot) {
+  try {
+    var tags=robot.getTags()
+    if(tags.contains('fd_role_assault'))return 'assault'
+    if(tags.contains('fd_role_sweep'))return 'sweep'
+    if(tags.contains('fd_role_gendarmerie'))return 'gendarmerie'
+    if(tags.contains('fd_role_air'))return 'air'
+    if(tags.contains('fd_role_support'))return 'support'
+  } catch(ignored) {}
+  var id=fdEntityId(robot)
+  if(fdIsAircraftType(id))return 'air'
+  if(id===String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') || id==='crusty_chunks:mortarer')return 'support'
+  return fdIsFrontier(fdSX(robot.x),fdSZ(robot.z))?'assault':'gendarmerie'
+}
+
+function fdEnsureRobotRole(robot) {
+  var role=fdRobotRole(robot)
+  try {robot.addTag('fd_role_'+role)} catch(ignored) {}
+  return role
+}
+
+function fdNewSquadTag(server,role) {
+  var serial=Number(server.persistentData.getInt('front_robot_squad_serial'))+1
+  if(serial>999999)serial=1
+  server.persistentData.putInt('front_robot_squad_serial',serial)
+  return 'fd_squad_'+role+'_'+serial
+}
+
+function fdWaveRole(frontSector,control,missingMortar) {
+  if(!frontSector)return 'gendarmerie'
+  if(missingMortar>0)return 'assault'
+  if(control>=fdOptionNumber('sweepControlMinimum',60) && Math.random()<fdOptionNumber('sweepSquadChance',0.30))return 'sweep'
+  return 'assault'
+}
+
+function fdTextHash(value) {
+  var hash=0
+  for(var i=0;i<value.length;i++)hash=((hash*31)+value.charCodeAt(i))|0
+  return Math.abs(hash)
+}
+
+function fdSquadKey(robot) {
+  try {
+    var iterator=robot.getTags().iterator()
+    while(iterator.hasNext()) {
+      var tag=String(iterator.next())
+      if(tag.indexOf('fd_squad_')===0)return tag
+    }
+  } catch(ignored) {}
+  try{return String(robot.uuid)}catch(ignoredToo){return fdEntityId(robot)}
 }
 
 function fdFormationOffset(robot,span) {
   var value=''
   try {value=String(robot.uuid)}catch(ignored){value=fdEntityId(robot)}
-  var hash=0
-  for(var i=0;i<value.length;i++)hash=((hash*31)+value.charCodeAt(i))|0
+  var hash=fdTextHash(value)
   return (Math.abs(hash)%(span*2+1))-span
+}
+
+function fdPatrolDestination(level,robot,role) {
+  var sx=fdSX(robot.x),sz=fdSZ(robot.z),center=fdSectorCenter(sx,sz)
+  var radius=role==='sweep'?fdOptionNumber('sweepPatrolRadius',24):fdOptionNumber('gendarmeriePatrolRadius',16)
+  radius=Math.max(4,Math.min(fdZoneSize()/2-4,radius))
+  var retask=Math.max(60,Math.floor(fdOptionNumber('patrolRetaskTicks',180)))
+  var phase=Math.floor(fdCombatTick/retask),hash=fdTextHash(fdSquadKey(robot))
+  var points=[[1,1],[-1,1],[-1,-1],[1,-1]],point=points[Math.abs(phase+hash)%points.length]
+  var spread=fdFormationOffset(robot,Math.max(2,Math.floor(fdZoneSize()/12)))
+  var x=Math.floor(center.x+point[0]*radius+spread),z=Math.floor(center.z+point[1]*radius-spread)
+  if(!level.getChunkSource().hasChunk(x>>4,z>>4))return null
+  if(fdInSafeZone(x,z))return null
+  var y=fdLoadedSurface(level,x,z)
+  if(y==null)return null
+  return {x:x,y:y,z:z}
+}
+
+function fdPatrolReady(robot) {
+  var next=0
+  try{next=Number(robot.persistentData.getLong('fd_patrol_retask'))}catch(ignored){}
+  if(next>fdCombatTick)return false
+  try{robot.persistentData.putLong('fd_patrol_retask',fdCombatTick+Math.max(60,Math.floor(fdOptionNumber('patrolRetaskTicks',180))))}catch(ignored){}
+  return true
 }
 
 function fdRallyDestination(level,robot,sx,sz,currentControl) {
@@ -938,7 +1029,10 @@ function fdCombatNetwork(server) {
         var civilianKey=fdMajorKey(fdSX(scannedEntity.x),fdSZ(scannedEntity.z))
         fdSettlementCivilians[civilianKey]=Number(fdSettlementCivilians[civilianKey] || 0)+1
       }
-      if (fdIsRobot(scannedEntity) && scannedEntity.getTags().contains('fd_robot')) fdTrackedRobots.push(scannedEntity)
+      if (fdIsRobot(scannedEntity) && scannedEntity.getTags().contains('fd_robot')) {
+        fdEnsureRobotRole(scannedEntity)
+        fdTrackedRobots.push(scannedEntity)
+      }
       else if (fdEntityId(scannedEntity).indexOf('simpleenemymod:') === 0) fdTrackedSem.push(scannedEntity)
     }
     fwScanEnd(server)
@@ -994,7 +1088,9 @@ function fdCombatNetwork(server) {
     try { currentTarget = movingRobot.getTarget() } catch (ignored) {}
     if (currentTarget != null && currentTarget.isAlive()) continue
 
-    if (fdSharedIntel != null) {
+    var movementRole=fdRobotRole(movingRobot)
+    if (fdSharedIntel != null && (movementRole==='assault' ||
+        (movementRole==='sweep' && fdSX(fdSharedIntel.x)===fdSX(movingRobot.x) && fdSZ(fdSharedIntel.z)===fdSZ(movingRobot.z)))) {
       try {
         // Radio only supplies an approximate search area. Each robot must then
         // acquire the player through its own AI, where Stealth remains active.
@@ -1003,7 +1099,11 @@ function fdCombatNetwork(server) {
       continue
     }
 
-    var destination = fdAdvanceDestination(level, movingRobot)
+    var destination=null
+    if(movementRole==='gendarmerie' || movementRole==='sweep') {
+      if(!fdPatrolReady(movingRobot))continue
+      destination=fdPatrolDestination(level,movingRobot,movementRole)
+    } else destination=fdAdvanceDestination(level, movingRobot)
     if (destination != null) {
       try { movingRobot.getNavigation().moveTo(destination.x, destination.y, destination.z,fdOptionNumber('aiAdvanceSpeed',1.15)) } catch (ignored) {}
     }
@@ -1085,7 +1185,7 @@ function fdIsSettlementSector(level,sx,sz) {
   return Number(fdSettlementCivilians[fdMajorKey(sx,sz)] || 0)>=fdOptionNumber('settlementCivilianMinimum',3)
 }
 
-function fdSpawnRobot(server, level, sx, sz, anchor, forcedType) {
+function fdSpawnRobot(server, level, sx, sz, anchor, forcedType, role, squadTag) {
   if(forcedType==='crusty_chunks:mortarer' && fwMissionEffect(server,fdKey(sx,sz),'mortar')) forcedType=fdInfantryType()
   if (fdSectorTerrain(level, sx, sz).ocean) return false
     var size = fdZoneSize()
@@ -1110,7 +1210,10 @@ function fdSpawnRobot(server, level, sx, sz, anchor, forcedType) {
     if (y == null) continue
 
     var spawnY = fdIsAircraftType(type) ? y + fdOptionNumber('aircraftSpawnHeight', 28) : y
-    fdCmd(server, `execute in minecraft:overworld run summon ${type} ${x} ${spawnY} ${z} {Tags:["fd_robot","fd_front_unit"],PersistenceRequired:1b}`)
+    var finalRole=fdIsAircraftType(type)?'air':((type===String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') || type==='crusty_chunks:mortarer')?'support':role)
+    var roleTag='fd_role_'+(finalRole || 'assault')
+    var groupTag=squadTag || 'fd_squad_legacy'
+    fdCmd(server, `execute in minecraft:overworld run summon ${type} ${x} ${spawnY} ${z} {Tags:["fd_robot","fd_front_unit","${roleTag}","${groupTag}"],PersistenceRequired:1b}`)
     return { x: x, z: z }
   }
   return null
@@ -1654,44 +1757,47 @@ function fdUpdateLocalFront(server) {
     if(missingSiegeMortars>0)cap=Math.max(cap,Math.min(robots+missingSiegeMortars,absoluteCap+missingSiegeMortars))
 
     if (robots >= cap) return
-    var selectedBatch = frontSector ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) : fdOptionNumber('rearSpawnBatch', 2)
+    var selectedBatch = frontSector ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) :
+      Math.max(fdOptionNumber('gendarmerieSquadMinimumSize',2),fdOptionNumber('rearSpawnBatch',2))
     var wave = Math.min(selectedBatch, cap - robots,
       Math.max(0,absoluteCap+missingSiegeMortars-parentCounts[parentKey]))
     if(wave<=0) return
+    var waveRole=fdWaveRole(frontSector,updated,missingSiegeMortars)
+    var squadTag=fdNewSquadTag(server,waveRole)
     var squadAnchor = null
     var rarePresent = fdCount(server, `@e[tag=fd_rare_support,${fdSectorBox(activeSector.sx, activeSector.sz)}]`) > 0
     for (var i = 0; i < wave; i++) {
-      var forcedType = fdInfantryType()
+      var forcedType = fdRoleInfantryType(waveRole)
       var rareSupport = false
       var heavyArmor = false
       var ciwsSupport = false
       var guaranteedMortar=missingSiegeMortars>0
       if (guaranteedMortar) {
         forcedType = 'crusty_chunks:mortarer'
-      } else if (i === 0 && wave >= fdOptionNumber('squadLeaderMinimumSize', 5) &&
+      } else if (waveRole==='assault' && i === 0 && wave >= fdOptionNumber('squadLeaderMinimumSize', 3) &&
           Math.random() < fdOptionNumber('squadLeaderChance', 0.35)) {
         var leaders = fdConfig.squadLeaderEntities || ['crusty_chunks:commander', 'crusty_chunks:scout']
         forcedType = String(leaders[Math.floor(Math.random() * leaders.length)])
-      } else if (!rarePresent && Math.random() < fdOptionNumber('rareSupportChancePerUnit', 0.02)) {
+      } else if (waveRole==='assault' && !rarePresent && Math.random() < fdOptionNumber('rareSupportChancePerUnit', 0.02)) {
         forcedType = fdRandomFrom(fdConfig.rareSupportEntities, 'crusty_chunks:hunter')
         rareSupport = true
         rarePresent = true
-      } else if (frontSector && updated>=fdOptionNumber('heavyArmorMinimumControl',55) &&
+      } else if (waveRole==='assault' && frontSector && updated>=fdOptionNumber('heavyArmorMinimumControl',55) &&
           parentHeavyCounts[parentKey]<fdOptionNumber('heavyArmorMaxPerMajorSector',1) &&
           Math.random()<fdOptionNumber('heavyArmorChancePerUnit',0.03)) {
         forcedType=fdRandomFrom(fdHeavyArmorEntities(),'crusty_chunks:decimator_hull')
         heavyArmor=true
-      } else if (updated>=fdOptionNumber('ciwsMinimumControl',60) &&
+      } else if (waveRole!=='sweep' && updated>=fdOptionNumber('ciwsMinimumControl',60) &&
           parentCiwsCounts[parentKey]<fdOptionNumber('ciwsMaxPerMajorSector',1) &&
           Math.random()<fdOptionNumber('ciwsChancePerUnit',0.02)) {
         forcedType=String(fdConfig.ciwsEntity || 'crusty_chunks:ciws')
         ciwsSupport=true
-      } else if (Math.random() < fdOptionNumber('mortarChancePerUnit', 0.025)) {
+      } else if (waveRole==='assault' && Math.random() < fdOptionNumber('mortarChancePerUnit', 0.025)) {
         forcedType = 'crusty_chunks:mortarer'
-      } else if (Math.random() < fdOptionNumber('supportChancePerUnit', 0.18)) {
+      } else if (waveRole==='assault' && Math.random() < fdOptionNumber('supportChancePerUnit', 0.18)) {
         forcedType = fdSupportType()
       }
-      var spawnedAt = fdSpawnRobot(server, level, activeSector.sx, activeSector.sz,heavyArmor?null:squadAnchor,forcedType)
+      var spawnedAt = fdSpawnRobot(server, level, activeSector.sx, activeSector.sz,heavyArmor?null:squadAnchor,forcedType,waveRole,squadTag)
       if(spawnedAt) {
         parentCounts[parentKey]++
         if(guaranteedMortar)missingSiegeMortars--
