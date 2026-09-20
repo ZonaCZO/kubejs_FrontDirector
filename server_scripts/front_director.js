@@ -270,7 +270,8 @@ function fdLoadConfig(server) {
     var value=Number(fdConfig[name]),range=numericRules[name]
     if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
   })
-  var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64]}
+  var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64],
+    backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64]}
   Object.keys(optionalNumericRules).forEach(name=>{
     if(fdConfig[name]==null)return
     var value=Number(fdConfig[name]),range=optionalNumericRules[name]
@@ -559,6 +560,28 @@ function fdIsSupplied(sx, sz) {
   return fdSupplyCache[fdKey(sx, sz)] === true
 }
 
+function fdRememberedResistance(server,sx,sz) {
+  fwLoad(server)
+  var defence=fwData.defence[fdKey(sx,sz)] || {}
+  var garrison=fdOps.garrisons[fdMajorKey(sx,sz)]
+  var strength=Math.max(0,Number(defence.strength || 0))
+  return {strength:strength,garrison:garrison && Number(garrison.strength)>0,
+    sufficient:Boolean(defence.sufficient) || strength>=fdOptionNumber('rememberedDefenceMinimum',5)}
+}
+
+function fdBackgroundTerrain(server,level,sx,sz,survey) {
+  var key=fdKey(sx,sz)
+  if(fdTerrainCache[key]!=null)return fdTerrainCache[key]
+  var record=survey[key]
+  if(!record || Number(record.known || 0)<1) {
+    return fdConfig.backgroundRequiresKnownTerrain===false ? {name:'обычная местность',factor:1.0} : null
+  }
+  if(record.ocean || record.terrain==='ocean')return {name:'океан',factor:0,ocean:true}
+  if(record.river || record.terrain==='river')return {name:'река',factor:Math.min(0.05,fdOptionNumber('riverExpansionFactor',0.05))}
+  if(record.mountain || record.terrain==='mountain')return {name:'горы',factor:fdOptionNumber('peakExpansionFactor',0.35)}
+  return {name:'обычная местность',factor:1.0}
+}
+
 function fdApplyIsolation(server) {
   fdRebuildSupply()
   var decay = fdOptionNumber('isolatedControlLossPerCycle', 8)
@@ -572,6 +595,9 @@ function fdApplyIsolation(server) {
 function fdStrategicExpansion(server) {
   var level = fdWorld(server)
   var nearby = fdActiveSectors(server, level)
+  var backgroundEnabled=fdConfig.backgroundExpansionEnabled!==false
+  var survey={}
+  try {survey=JSON.parse(String(server.persistentData.getString('front_cc_terrain')) || '{}')}catch(ignored){survey={}}
   var candidates = []
   var seen = {}
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
@@ -586,27 +612,42 @@ function fdStrategicExpansion(server) {
       var nx = sx + dirs[d][0]
       var nz = sz + dirs[d][1]
       var nk = fdKey(nx, nz)
-      if (!nearby[nk]) continue
+      var background=!nearby[nk]
+      if (background && !backgroundEnabled) continue
       if (seen[nk] || !fdAllowedSector(nx, nz) || fdControl(nx, nz) >= 100) continue
       if (Number(fdOps.protection[nk] || 0) > fdGameTime(server)) continue
+      var resistance=fdRememberedResistance(server,nx,nz)
+      // Remembered forces hold an unloaded sector until a player returns to command the battle.
+      if(background && (resistance.garrison || resistance.sufficient))continue
+      var backgroundTerrain=background?fdBackgroundTerrain(server,level,nx,nz,survey):null
+      // Never load/generate a chunk merely to move the strategic simulation.
+      if(background && backgroundTerrain==null)continue
       seen[nk] = true
-      candidates.push({ sx: nx, sz: nz })
+      candidates.push({ sx: nx, sz: nz, background:background, terrain:backgroundTerrain, resistance:resistance })
     }
   })
 
   if (candidates.length === 0) return
-  candidates.sort((a, b) => fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz))
-  var limit = Math.min(Number(fdConfig.sectorsAdvancedPerCycle), candidates.length)
+  candidates.sort((a, b) => Number(a.background)-Number(b.background) || fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz))
+  var selected=[]
+  var backgroundLimit=Math.max(0,Math.floor(fdOptionNumber('backgroundSectorsPerCycle',fdConfig.sectorsAdvancedPerCycle)))
+  var backgroundUsed=0
+  for(var c=0;c<candidates.length && selected.length<Number(fdConfig.sectorsAdvancedPerCycle);c++) {
+    if(candidates[c].background && backgroundUsed>=backgroundLimit)continue
+    selected.push(candidates[c])
+    if(candidates[c].background)backgroundUsed++
+  }
 
-  for (var i = 0; i < limit; i++) {
-    var terrain = fdSectorTerrain(level, candidates[i].sx, candidates[i].sz)
+  for (var i = 0; i < selected.length; i++) {
+    var candidate=selected[i]
+    var terrain = candidate.background ? candidate.terrain : fdSectorTerrain(level, candidate.sx, candidate.sz)
     if (terrain.ocean) continue
     // River crossings are rare attempts rather than a rounded minimum gain.
     if (terrain.name === 'река' && Math.random() >= terrain.factor) continue
     var strategicGain = Math.max(1, Math.round(Number(fdConfig.expansionControlGain) *
-      fdStrength(candidates[i].sx, candidates[i].sz) * terrain.factor))
-    var candidateKey = fdKey(candidates[i].sx, candidates[i].sz)
-    var garrison = fdOps.garrisons[fdMajorKey(candidates[i].sx,candidates[i].sz)]
+      fdStrength(candidate.sx, candidate.sz) * terrain.factor))
+    var candidateKey = fdKey(candidate.sx, candidate.sz)
+    var garrison = fdOps.garrisons[fdMajorKey(candidate.sx,candidate.sz)]
     if (garrison && Number(garrison.strength) > 0) {
       strategicGain -= Number(garrison.strength) * fdOptionNumber('garrisonDefensePerSoldier', 3)
       fdOps.alerts[candidateKey] = Math.min(4, Number(fdOps.alerts[candidateKey] || 0) + 1)
@@ -614,10 +655,11 @@ function fdStrategicExpansion(server) {
       if (strategicGain <= 0) continue
     }
     if (fwMissionEffect(server,candidateKey,'headquarters') || fwMissionEffect(server,candidateKey,'depot')) continue
-    var oldControl=fdControl(candidates[i].sx,candidates[i].sz)
-    fdSetControl(candidates[i].sx, candidates[i].sz,
-      fdControl(candidates[i].sx, candidates[i].sz) + strategicGain)
-    if(oldControl===0 && fdControl(candidates[i].sx,candidates[i].sz)>0) fwMail(server,candidateKey,'advance')
+    if(candidate.background && candidate.resistance.strength>0)strategicGain-=candidate.resistance.strength*fdOptionNumber('garrisonDefensePerSoldier',3)
+    if(strategicGain<=0)continue
+    var oldControl=fdControl(candidate.sx,candidate.sz)
+    fdSetControl(candidate.sx, candidate.sz,fdControl(candidate.sx, candidate.sz) + strategicGain)
+    if(oldControl===0 && fdControl(candidate.sx,candidate.sz)>0) fwMail(server,candidateKey,'advance')
   }
   fdSave(server)
   fdOpsSave(server)
