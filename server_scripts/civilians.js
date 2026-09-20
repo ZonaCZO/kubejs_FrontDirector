@@ -1,12 +1,19 @@
 // Villagers Reborn 1.0.9b. Cultural identity never determines political loyalty.
 var cvConfig=JsonIO.read('kubejs/config/civilians.json')
-var cvBase=null,cvTest=null,cvRegistry=null,cvTicks=0
+var cvBase=null,cvTest=null,cvRegistry=null,cvTicks=0,cvReactionCursor=0
 try {
  cvBase=Java.loadClass('com.javic.slimpatch.entity.AbstractRomanceVillagerEntity')
  cvTest=Java.loadClass('net.minecraft.world.level.entity.EntityTypeTest')
  cvRegistry=Java.loadClass('net.minecraftforge.registries.ForgeRegistries')
 }catch(cvMissing){console.warn('[Civilians] Villagers Reborn unavailable; disabled')}
 function cvTarget(e){return cvBase && e instanceof cvBase}
+function cvEntityId(e){
+ try{return String(cvRegistry.ENTITY_TYPES.getKey(e.getType()))}catch(ignored){}
+ try{return String(e.type.arch$registryName())}catch(ignored){}
+ try{return String(e.type)}catch(ignored){}
+ return ''
+}
+function cvCivilian(e){return cvTarget(e) || cvEntityId(e)==='minecraft:villager'}
 function cvClamp(value){return Math.max(0,Math.min(100,Number(value)))}
 function cvValue(key,fallback){var v=Number(cvConfig[key]);return isFinite(v)?v:fallback}
 function cvWrite(e,state){e.persistentData.putString('civilian_v1',JSON.stringify(state))}
@@ -40,6 +47,49 @@ function cvAdjust(e,trust,fear){
  // Fear is NOT allegiance and does not automatically make anyone loyal.
  cvWrite(e,state)
 }
+function cvReactionRole(e){
+ if(cvTarget(e)){
+  var state=cvState(e)
+  if(state && state.loyalty==='invader')return 'collaborator'
+  var chance=state && state.loyalty==='player'?cvValue('playerLoyalResistanceChance',0.12):cvValue('neutralResistanceChance',0.04)
+  return Math.random()<Math.max(0,Math.min(1,chance))?'resist':'flee'
+ }
+ return Math.random()<Math.max(0,Math.min(1,cvValue('neutralResistanceChance',0.04)))?'resist':'flee'
+}
+function cvRememberedReaction(e){
+ var role=''
+ try{role=String(e.persistentData.getString('civilian_robot_role'))}catch(ignored){}
+ if(role==='collaborator' || role==='resist' || role==='flee')return role
+ role=cvReactionRole(e)
+ try{e.persistentData.putString('civilian_robot_role',role)}catch(ignored){}
+ return role
+}
+function cvNavigate(e,x,y,z,speed){
+ try{e.getNavigation().moveTo(x,y,z,speed);return true}catch(ignored){}
+ return false
+}
+function cvReactToRobot(civilian,robot,now){
+ var ready=0
+ try{ready=Number(civilian.persistentData.getLong('civilian_robot_react_at'))}catch(ignored){}
+ if(ready>now)return
+ try{civilian.persistentData.putLong('civilian_robot_react_at',now+Math.max(20,cvValue('civilianReactionCooldownTicks',100)))}catch(ignored){}
+ var role=cvRememberedReaction(civilian)
+ if(role==='collaborator')return
+ if(cvTarget(civilian))cvAdjust(civilian,0,2)
+ var dx=Number(civilian.x)-Number(robot.x),dz=Number(civilian.z)-Number(robot.z)
+ var distance=Math.sqrt(dx*dx+dz*dz)
+ if(distance<0.01){dx=Math.random()-0.5;dz=Math.random()-0.5;distance=Math.sqrt(dx*dx+dz*dz)}
+ if(role==='resist'){
+  cvNavigate(civilian,robot.x,robot.y,robot.z,cvValue('resistanceSpeed',0.85))
+  if(distance<=3.5){
+   try{robot.hurt(robot.damageSources().mobAttack(civilian),Math.max(0,cvValue('resistanceDamage',1)))}catch(ignored){}
+   try{robot.knockback(0.25,Number(robot.x)-Number(civilian.x),Number(robot.z)-Number(civilian.z))}catch(ignored){}
+  }
+  return
+ }
+ var flee=Math.max(4,cvValue('fleeDistance',10))
+ cvNavigate(civilian,Number(civilian.x)+dx/distance*flee,civilian.y,Number(civilian.z)+dz/distance*flee,cvValue('fleeSpeed',1.15))
+}
 EntityEvents.hurt(event=>{
  if(!cvBase || !cvConfig.enabled || !cvTarget(event.entity))return
  var source=null
@@ -60,8 +110,26 @@ EntityEvents.death(event=>{
  for(var i=0;i<Math.min(32,list.size());i++)cvAdjust(list.get(i),-cvValue('civilianDeathTrustLoss',8),cvValue('civilianDeathFearGain',12))
 })
 ServerEvents.tick(event=>{
- if(!cvBase || !cvConfig.enabled)return
- cvTicks++;if(cvTicks%1200!==0)return
+ if(!cvConfig.enabled)return
+ cvTicks++
+ if(cvConfig.robotReactionEnabled && cvTicks%Math.max(20,cvValue('robotReactionIntervalTicks',40))===0 && typeof fdTrackedRobots!=='undefined'){
+  var robots=fdTrackedRobots,budget=Math.max(1,Math.floor(cvValue('robotReactionBudget',24))),seen={}
+  var radius=Math.max(4,cvValue('robotReactionRadius',14)),now=0
+  try{now=Number(event.server.overworld().getGameTime())}catch(ignored){now=cvTicks}
+  for(var r=0;r<robots.length && budget>0;r++){
+   var robot=robots[(r+cvReactionCursor)%robots.length]
+   if(!robot || !robot.isAlive())continue
+   var nearby=null
+   try{nearby=robot.level.getEntities(robot,robot.getBoundingBox().inflate(radius))}catch(ignored){continue}
+   for(var n=0;n<nearby.size() && budget>0;n++){
+    var civilian=nearby.get(n),key=String(civilian.uuid)
+    if(seen[key] || !civilian.isAlive() || !cvCivilian(civilian))continue
+    seen[key]=true;budget--;cvReactToRobot(civilian,robot,now)
+   }
+  }
+  if(robots.length)cvReactionCursor=(cvReactionCursor+1)%robots.length
+ }
+ if(!cvBase || cvTicks%1200!==0)return
  var levels=event.server.getAllLevels().iterator(),seen={},budget=64
  while(levels.hasNext() && budget>0){
   var level=levels.next(),players=level.players

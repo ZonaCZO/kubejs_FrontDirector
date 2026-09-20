@@ -1760,6 +1760,11 @@ ServerEvents.tick(event => {
 EntityEvents.death(event => {
   if(fdInitialized) fwEntityDeath(event)
   if (!fdConfig || !fdConfig.enabled || !fdIsRobot(event.entity)) return
+  // Civilian resistance is local atmosphere only. Even when a desperate
+  // villager finishes a robot, it must not move the strategic front.
+  var damageActor=null
+  try{damageActor=event.source.getEntity()}catch(ignored){try{damageActor=event.source.actual}catch(ignoredToo){}}
+  if(damageActor && fdIsCivilianEntity(damageActor))return
   var entity = event.entity
   var sx = fdSX(entity.x)
   var sz = fdSZ(entity.z)

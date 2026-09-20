@@ -11,5 +11,16 @@
   "civilianDeathFearGain": 12,
   "invaderAttackTrustGain": 4,
   "fearRecoveryPerMinute": 1,
-  "nearbyDeathRadius": 32
+  "nearbyDeathRadius": 32,
+  "robotReactionEnabled": true,
+  "robotReactionIntervalTicks": 40,
+  "robotReactionRadius": 14,
+  "robotReactionBudget": 24,
+  "civilianReactionCooldownTicks": 100,
+  "fleeDistance": 10,
+  "fleeSpeed": 1.15,
+  "neutralResistanceChance": 0.04,
+  "playerLoyalResistanceChance": 0.12,
+  "resistanceDamage": 1.0,
+  "resistanceSpeed": 0.85
 }
