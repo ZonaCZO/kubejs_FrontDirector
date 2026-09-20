@@ -5,6 +5,14 @@ var FD_BlockPos = Java.loadClass('net.minecraft.core.BlockPos')
 var FD_Heightmap = Java.loadClass('net.minecraft.world.level.levelgen.Heightmap$Types')
 var FD_BiomeTags = Java.loadClass('net.minecraft.tags.BiomeTags')
 var FD_LostCities = Java.loadClass('mcjty.lostcities.LostCities')
+var FD_DecimatorSpawn = null
+var FD_EradicatorSpawn = null
+try {
+  FD_DecimatorSpawn = Java.loadClass('net.mcreator.crustychunks.procedures.DecimatorSpawnProcedure')
+  FD_EradicatorSpawn = Java.loadClass('net.mcreator.crustychunks.procedures.EradicatorSpawnProcedure')
+} catch (fdHeavyProcedureMissing) {
+  console.warn('[Front Director] Warium heavy assembly procedures unavailable: '+fdHeavyProcedureMissing)
+}
 
 var FD_CONFIG = 'kubejs/config/front_director_v3.json'
 
@@ -448,6 +456,45 @@ function fdIsHeavyArmorType(type) {
   var armor=fdHeavyArmorEntities()
   for(var i=0;i<armor.length;i++)if(String(armor[i])===String(type))return true
   return false
+}
+
+function fdHeavySpawnProcedure(type) {
+  if(String(type)==='crusty_chunks:decimator_hull')return FD_DecimatorSpawn
+  if(String(type)==='crusty_chunks:prototype_hull' || String(type)==='crusty_chunks:eradicator_hull')return FD_EradicatorSpawn
+  return null
+}
+
+function fdAssembleHeavy(level,hull) {
+  var type=fdEntityId(hull),procedure=fdHeavySpawnProcedure(type)
+  if(procedure==null)return false
+  try {
+    if(!hull.getPassengers().isEmpty()) {
+      hull.addTag('fd_heavy_assembled')
+      return true
+    }
+  }catch(ignored){}
+  try {
+    // /summon bypasses Warium's finalizeSpawn hook. Calling the mod's own
+    // procedure preserves its native random turret choice and riding setup.
+    procedure.execute(level,Number(hull.x),Number(hull.y),Number(hull.z),hull)
+    hull.addTag('fd_heavy_assembled')
+    return true
+  } catch(error) {
+    console.warn('[Front Director] Cannot assemble '+type+': '+error)
+    return false
+  }
+}
+
+function fdFindTaggedEntity(level,type,tag,x,y,z) {
+  var iterator=level.getAllEntities().iterator(),best=null,bestDistance=64
+  while(iterator.hasNext()) {
+    var entity=iterator.next()
+    if(fdEntityId(entity)!==String(type))continue
+    try{if(!entity.getTags().contains(tag))continue}catch(ignored){continue}
+    var dx=Number(entity.x)-x,dy=Number(entity.y)-y,dz=Number(entity.z)-z,distance=dx*dx+dy*dy+dz*dz
+    if(distance<bestDistance){best=entity;bestDistance=distance}
+  }
+  return best
 }
 
 function fdCountEntityTypes(server,types,box) {
@@ -1031,6 +1078,7 @@ function fdCombatNetwork(server) {
       }
       if (fdIsRobot(scannedEntity) && scannedEntity.getTags().contains('fd_robot')) {
         fdEnsureRobotRole(scannedEntity)
+        if(fdIsHeavyArmorType(fdEntityId(scannedEntity)) && !scannedEntity.getTags().contains('fd_heavy_assembled'))fdAssembleHeavy(level,scannedEntity)
         fdTrackedRobots.push(scannedEntity)
       }
       else if (fdEntityId(scannedEntity).indexOf('simpleenemymod:') === 0) fdTrackedSem.push(scannedEntity)
@@ -1213,7 +1261,16 @@ function fdSpawnRobot(server, level, sx, sz, anchor, forcedType, role, squadTag)
     var finalRole=fdIsAircraftType(type)?'air':((type===String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') || type==='crusty_chunks:mortarer')?'support':role)
     var roleTag='fd_role_'+(finalRole || 'assault')
     var groupTag=squadTag || 'fd_squad_legacy'
-    fdCmd(server, `execute in minecraft:overworld run summon ${type} ${x} ${spawnY} ${z} {Tags:["fd_robot","fd_front_unit","${roleTag}","${groupTag}"],PersistenceRequired:1b}`)
+    var assemblyTag=fdIsHeavyArmorType(type)?'fd_heavy_assembly':''
+    var assemblyNbt=assemblyTag?',"'+assemblyTag+'"':''
+    fdCmd(server, `execute in minecraft:overworld run summon ${type} ${x} ${spawnY} ${z} {Tags:["fd_robot","fd_front_unit","${roleTag}","${groupTag}"${assemblyNbt}],PersistenceRequired:1b}`)
+    if(assemblyTag) {
+      var hull=fdFindTaggedEntity(level,type,assemblyTag,x,spawnY,z)
+      if(hull!=null) {
+        fdAssembleHeavy(level,hull)
+        try{hull.removeTag(assemblyTag)}catch(ignored){}
+      }
+    }
     return { x: x, z: z }
   }
   return null
