@@ -274,6 +274,8 @@ function fdLoadConfig(server) {
     backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64],
     heavyArmorChancePerUnit:[0,1],heavyArmorMinimumControl:[0,100],heavyArmorMaxPerMajorSector:[0,8],
     riverExpansionFactor:[0,1],riverControlFactor:[0.05,1],
+    aiCommandRadiusBlocks:[64,768],aiCommandIntervalTicks:[20,200],aiBatchSize:[1,64],
+    aiAdvanceSpeed:[0.5,2],aiRallyEdgeFraction:[0.1,0.45],
     ciwsChancePerUnit:[0,1],ciwsMinimumControl:[0,100],ciwsMaxPerMajorSector:[0,8]}
   Object.keys(optionalNumericRules).forEach(name=>{
     if(fdConfig[name]==null)return
@@ -849,11 +851,49 @@ function fdRememberTarget(target) {
   }
 }
 
+function fdAiActive(level,robot) {
+  var radius=fdOptionNumber('aiCommandRadiusBlocks',384),limit=radius*radius
+  var players=level.players
+  for(var i=0;i<players.size();i++) {
+    var dx=Number(players.get(i).x)-Number(robot.x),dz=Number(players.get(i).z)-Number(robot.z)
+    if(dx*dx+dz*dz<=limit)return true
+  }
+  return false
+}
+
+function fdMobileFrontUnit(robot) {
+  var id=fdEntityId(robot)
+  return id!==String(fdConfig.ciwsEntity || 'crusty_chunks:ciws') && id!=='crusty_chunks:mortarer'
+}
+
+function fdFormationOffset(robot,span) {
+  var value=''
+  try {value=String(robot.uuid)}catch(ignored){value=fdEntityId(robot)}
+  var hash=0
+  for(var i=0;i<value.length;i++)hash=((hash*31)+value.charCodeAt(i))|0
+  return (Math.abs(hash)%(span*2+1))-span
+}
+
+function fdRallyDestination(level,robot,sx,sz,currentControl) {
+  var dirs=[[1,0],[-1,0],[0,1],[0,-1]],rear=null,rearControl=currentControl
+  for(var i=0;i<dirs.length;i++) {
+    var neighborControl=fdControl(sx+dirs[i][0],sz+dirs[i][1])
+    if(neighborControl>rearControl) {rearControl=neighborControl;rear=dirs[i]}
+  }
+  if(rear==null)return null
+  var forward={x:-rear[0],z:-rear[1]},size=fdZoneSize(),edge=fdOptionNumber('aiRallyEdgeFraction',0.38)*size
+  var lateral=fdFormationOffset(robot,Math.max(3,Math.floor(size/6)))
+  var x=Math.floor(sx*size+size/2+forward.x*edge-forward.z*lateral)
+  var z=Math.floor(sz*size+size/2+forward.z*edge+forward.x*lateral)
+  if(!level.getChunkSource().hasChunk(x>>4,z>>4))return null
+  return {x:x,y:level.getHeight(FD_Heightmap.MOTION_BLOCKING_NO_LEAVES,x,z),z:z}
+}
+
 function fdAdvanceDestination(level, robot) {
   var sx = fdSX(robot.x)
   var sz = fdSZ(robot.z)
   var currentControl = fdControl(sx, sz)
-  if (currentControl <= 0) return null
+  if(currentControl<Number(fdConfig.expansionSourceControl))return fdRallyDestination(level,robot,sx,sz,currentControl)
 
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
   var best = null
@@ -865,11 +905,15 @@ function fdAdvanceDestination(level, robot) {
     var neighborControl = fdControl(nx, nz)
     if (neighborControl >= currentControl && neighborControl >= 70) continue
     var terrain = fdSectorTerrain(level, nx, nz)
+    if(terrain.ocean)continue
     var score = (currentControl - neighborControl) * 10 + fdNearestOriginDistance(nx, nz) / 256
     score -= (1.0 - terrain.factor) * fdOptionNumber('terrainPathPenalty', 500)
     if (score > bestScore) {
       bestScore = score
       best = fdSectorCenter(nx, nz)
+      var directionX=nx-sx,directionZ=nz-sz,lateral=fdFormationOffset(robot,Math.max(3,Math.floor(fdZoneSize()/6)))
+      best.x-=directionZ*lateral
+      best.z+=directionX*lateral
     }
   }
   if (best == null) return null
@@ -880,7 +924,6 @@ function fdAdvanceDestination(level, robot) {
 
 function fdCombatNetwork(server) {
   var level = fdWorld(server)
-  var nearby=fdActiveSectors(server,level)
   if (fdCombatTick - fdEntityScanTick >= FD_ENTITY_SCAN_INTERVAL) {
     fdTrackedRobots = []
     fdTrackedSem = []
@@ -906,7 +949,7 @@ function fdCombatNetwork(server) {
   var robots = fdTrackedRobots
   var semSoldiers = fdTrackedSem
   if (robots.length === 0) return
-  var batch = Math.min(FD_AI_BATCH, robots.length)
+  var batch = Math.min(Math.floor(fdOptionNumber('aiBatchSize',16)), robots.length)
 
   // Player detection belongs entirely to Stealth. We only relay a target that
   // Warium's own AI has already acquired. This preserves light, crouching,
@@ -914,7 +957,7 @@ function fdCombatNetwork(server) {
   for (var r = 0; r < batch; r++) {
     var robot = robots[(fdCombatCursor + r) % robots.length]
     if (!robot || !robot.isAlive()) continue
-    if(!nearby[fdKey(fdSX(robot.x),fdSZ(robot.z))])continue
+    if(!fdAiActive(level,robot))continue
     fwRiverSlow(robot,level)
     var acquiredTarget = null
     try { acquiredTarget = robot.getTarget() } catch (ignored) {}
@@ -946,7 +989,7 @@ function fdCombatNetwork(server) {
   for (var a = 0; a < batch; a++) {
     var movingRobot = robots[(fdCombatCursor + a) % robots.length]
     if (!movingRobot || !movingRobot.isAlive()) continue
-    if(!nearby[fdKey(fdSX(movingRobot.x),fdSZ(movingRobot.z))])continue
+    if(!fdAiActive(level,movingRobot) || !fdMobileFrontUnit(movingRobot))continue
     var currentTarget = null
     try { currentTarget = movingRobot.getTarget() } catch (ignored) {}
     if (currentTarget != null && currentTarget.isAlive()) continue
@@ -955,14 +998,14 @@ function fdCombatNetwork(server) {
       try {
         // Radio only supplies an approximate search area. Each robot must then
         // acquire the player through its own AI, where Stealth remains active.
-        movingRobot.getNavigation().moveTo(fdSharedIntel.x, fdSharedIntel.y, fdSharedIntel.z, 1.15)
+        movingRobot.getNavigation().moveTo(fdSharedIntel.x, fdSharedIntel.y, fdSharedIntel.z,fdOptionNumber('aiAdvanceSpeed',1.15))
       } catch (ignored) {}
       continue
     }
 
     var destination = fdAdvanceDestination(level, movingRobot)
     if (destination != null) {
-      try { movingRobot.getNavigation().moveTo(destination.x, destination.y, destination.z, 1.0) } catch (ignored) {}
+      try { movingRobot.getNavigation().moveTo(destination.x, destination.y, destination.z,fdOptionNumber('aiAdvanceSpeed',1.15)) } catch (ignored) {}
     }
   }
   fdCombatCursor = (fdCombatCursor + batch) % robots.length
@@ -1700,7 +1743,7 @@ ServerEvents.tick(event => {
   fdTick++
   if(event.server.persistentData.getBoolean('front_gm_paused'))return
   fdCombatTick++
-  if (fdCombatTick % FD_AI_INTERVAL === 0) fdCombatNetwork(event.server)
+  if (fdCombatTick % Math.max(20,Math.floor(fdOptionNumber('aiCommandIntervalTicks',60))) === 0) fdCombatNetwork(event.server)
   if (fdTick % FD_CHECK_TICKS !== 0) return
 
   var server = event.server
