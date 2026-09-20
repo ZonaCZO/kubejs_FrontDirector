@@ -12,6 +12,29 @@ var fmLoaded = false
 var FM_TERRAIN_VERSION = 3
 var fmMetadata = null
 var fmSignature = ''
+var FM_NBT_CHUNK_CHARS = 12000
+
+function fmReadChunks(data,key) {
+  var count=Math.max(0,Number(data.getInt(key+'_parts') || 0))
+  if(count>0 && count<256) {
+    var result=''
+    for(var i=0;i<count;i++)result+=String(data.getString(key+'_'+i))
+    return result
+  }
+  return String(data.getString(key) || '')
+}
+
+function fmWriteChunks(data,key,value) {
+  var text=String(value || '')
+  var oldCount=Math.max(0,Number(data.getInt(key+'_parts') || 0))
+  var count=Math.ceil(text.length/FM_NBT_CHUNK_CHARS)
+  // Clear the legacy monolithic value first. Otherwise one more world save may
+  // still fail before the chunked replacement reaches disk.
+  data.putString(key,'')
+  for(var i=0;i<count;i++)data.putString(key+'_'+i,text.slice(i*FM_NBT_CHUNK_CHARS,(i+1)*FM_NBT_CHUNK_CHARS))
+  for(var stale=count;stale<oldCount;stale++)data.putString(key+'_'+stale,'')
+  data.putInt(key+'_parts',count)
+}
 
 function fmPrepare(server) {
   if (!global.frontMapBuild) return false
@@ -19,11 +42,25 @@ function fmPrepare(server) {
   if (!encoded) return false
   fmMetadata = JSON.parse(String(encoded))
   if (!fmLoaded) {
-    try { fmTerrain = JSON.parse(String(server.persistentData.getString('front_cc_terrain')) || '{}') } catch (fmError) { fmTerrain = {} }
+    var savedSurvey=fmReadChunks(server.persistentData,'front_cc_survey') || fmReadChunks(server.persistentData,'front_cc_terrain')
+    try { fmTerrain = JSON.parse(savedSurvey || '{}') } catch (fmError) { fmTerrain = {} }
+    // The failed oversized survey may be empty on disk while the last compact
+    // snapshot is still valid. Recover its terrain instead of repainting the map.
+    if(Object.keys(fmTerrain).length===0) {
+      try {
+        var legacySnapshot=JSON.parse(fmReadChunks(server.persistentData,'front_cc_snapshot') || '{}')
+        if(legacySnapshot && legacySnapshot.terrain)fmTerrain=legacySnapshot.terrain
+      } catch(ignoredLegacySnapshot) {}
+    }
     fmLoaded = true
     // Re-survey when biome classification changes.
     if(Number(server.persistentData.getInt('front_cc_terrain_version'))!==FM_TERRAIN_VERSION) fmTerrain={}
     server.persistentData.putInt('front_cc_terrain_version',FM_TERRAIN_VERSION)
+    // Migrate immediately, before the next autosave has a chance to serialize
+    // the oversized legacy string again.
+    fmWriteChunks(server.persistentData,'front_cc_survey',JSON.stringify(fmTerrain))
+    server.persistentData.putString('front_cc_terrain','')
+    server.persistentData.putInt('front_cc_terrain_parts',0)
   }
   var signature = JSON.stringify([fmMetadata.sector_size, fmMetadata.areas])
   if (signature !== fmSignature) {
@@ -124,16 +161,12 @@ ServerEvents.tick(event => {
   var encodedSnapshot=global.frontMapBuild(mapServer)
   if(!encodedSnapshot) return
   var snapshot=JSON.parse(String(encodedSnapshot))
-  snapshot.terrain={}
-  var terrainKeys=Object.keys(fmTerrain)
-  for(var t=0;t<terrainKeys.length;t++) {
-    var entry=fmTerrain[terrainKeys[t]]
-    snapshot.terrain[terrainKeys[t]]={terrain:entry.terrain,known:entry.known,water_fraction:entry.water_fraction,
-      ocean:entry.ocean,ocean_fraction:entry.ocean_fraction,river:entry.river,mountain:entry.mountain,height:entry.height}
-  }
   snapshot.updated=Number(fmClock)
   snapshot.updated_clock='bridge_session_ticks'
   snapshot.survey_limit=4096
-  mapServer.persistentData.putString('front_cc_snapshot',JSON.stringify(snapshot))
-  mapServer.persistentData.putString('front_cc_terrain',JSON.stringify(fmTerrain))
+  fmWriteChunks(mapServer.persistentData,'front_cc_snapshot',JSON.stringify(snapshot))
+  fmWriteChunks(mapServer.persistentData,'front_cc_survey',JSON.stringify(fmTerrain))
+  // Retire the oversized legacy field that caused UTFDataFormatException.
+  mapServer.persistentData.putString('front_cc_terrain','')
+  mapServer.persistentData.putInt('front_cc_terrain_parts',0)
 })

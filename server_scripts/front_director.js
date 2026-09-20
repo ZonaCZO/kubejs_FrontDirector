@@ -271,7 +271,10 @@ function fdLoadConfig(server) {
     if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
   })
   var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64],
-    backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64]}
+    backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64],
+    heavyArmorChancePerUnit:[0,1],heavyArmorMinimumControl:[0,100],heavyArmorMaxPerMajorSector:[0,8],
+    riverExpansionFactor:[0,1],riverControlFactor:[0.05,1],
+    ciwsChancePerUnit:[0,1],ciwsMinimumControl:[0,100],ciwsMaxPerMajorSector:[0,8]}
   Object.keys(optionalNumericRules).forEach(name=>{
     if(fdConfig[name]==null)return
     var value=Number(fdConfig[name]),range=optionalNumericRules[name]
@@ -316,10 +319,10 @@ function fdGameTime(server) {
 function fdOpsLoad(server) {
   var migrated = false
   try {
-    migrated=server.persistentData.contains(fdOpsStorage())
-    fdOps = server.persistentData.contains(migrated?fdOpsStorage():'front_director_v6_ops')
-      ? JSON.parse(String(server.persistentData.getString(migrated?fdOpsStorage():'front_director_v6_ops')))
-      : { liberated: {}, protection: {}, garrisons: {}, alerts: {} }
+    var currentStorage=fdOpsStorage()
+    migrated=server.persistentData.contains(currentStorage) || Number(server.persistentData.getInt(currentStorage+'_parts'))>0
+    var encodedOps=fdReadPersistentChunks(server.persistentData,migrated?currentStorage:'front_director_v6_ops')
+    fdOps = encodedOps ? JSON.parse(encodedOps) : { liberated: {}, protection: {}, garrisons: {}, alerts: {} }
   } catch (error) {
     console.error('[Front Director v6] operations state reset: ' + error)
     fdOps = { liberated: {}, protection: {}, garrisons: {}, alerts: {} }
@@ -339,7 +342,7 @@ function fdOpsLoad(server) {
 
 function fdOpsSave(server) {
   if (!fdOpsDirty) return
-  server.persistentData.putString(fdOpsStorage(), JSON.stringify(fdOps))
+  fdWritePersistentChunks(server.persistentData,fdOpsStorage(),JSON.stringify(fdOps))
   fdOpsDirty = false
 }
 
@@ -421,6 +424,22 @@ function fdBiomeInfoAtLoaded(level, x, z) {
   return null
 }
 
+function fdHeavyArmorEntities() {
+  return fdConfig.heavyArmorEntities || ['crusty_chunks:decimator_hull','crusty_chunks:prototype_hull','crusty_chunks:eradicator_hull']
+}
+
+function fdIsHeavyArmorType(type) {
+  var armor=fdHeavyArmorEntities()
+  for(var i=0;i<armor.length;i++)if(String(armor[i])===String(type))return true
+  return false
+}
+
+function fdCountEntityTypes(server,types,box) {
+  var total=0
+  for(var i=0;i<types.length;i++)total+=fdCount(server,`@e[type=${String(types[i])},tag=fd_robot,${box}]`)
+  return total
+}
+
 function fdBiomeIdAtLoaded(level, x, z) {
   var info=fdBiomeInfoAtLoaded(level,x,z)
   return info?info.id:''
@@ -451,7 +470,8 @@ function fdSectorTerrain(level, sx, sz) {
   // Unknown/unloaded terrain never forces chunk generation on the server thread.
   var result = { name: 'обычная местность', factor: 1.0 }
   if (oceans > 0 && oceans / known >= 0.5) result = { name: 'океан', factor: 0, ocean: true }
-  else if (rivers > 0) result = { name: 'река', factor: Math.min(0.05,fdOptionNumber('riverExpansionFactor', 0.05)) }
+  else if (rivers > 0) result = { name: 'река', factor: fdOptionNumber('riverControlFactor',0.5),
+    crossingChance:fdOptionNumber('riverExpansionFactor',0.2) }
   else if (peaks > 0) result = { name: 'горы', factor: fdOptionNumber('peakExpansionFactor', 0.35) }
   if (known === points.length) fdTerrainCache[key] = result
   return result
@@ -474,17 +494,17 @@ function fdSetControl(sx, sz, value) {
 
 function fdSave(server) {
   if (!fdDirty) return
-  server.persistentData.putString(fdStateStorage(), JSON.stringify(fdState))
+  fdWritePersistentChunks(server.persistentData,fdStateStorage(),JSON.stringify(fdState))
   fdDirty = false
 }
 
 function fdLoadState(server) {
   var migrated = false
   try {
-    migrated=server.persistentData.contains(fdStateStorage())
-    fdState = server.persistentData.contains(migrated?fdStateStorage():'front_director_v3_state')
-      ? JSON.parse(String(server.persistentData.getString(migrated?fdStateStorage():'front_director_v3_state')))
-      : {}
+    var currentStorage=fdStateStorage()
+    migrated=server.persistentData.contains(currentStorage) || Number(server.persistentData.getInt(currentStorage+'_parts'))>0
+    var encodedState=fdReadPersistentChunks(server.persistentData,migrated?currentStorage:'front_director_v3_state')
+    fdState=encodedState?JSON.parse(encodedState):{}
   } catch (error) {
     console.error('[Front Director v3] state reset: ' + error)
     fdState = {}
@@ -577,9 +597,66 @@ function fdBackgroundTerrain(server,level,sx,sz,survey) {
     return fdConfig.backgroundRequiresKnownTerrain===false ? {name:'обычная местность',factor:1.0} : null
   }
   if(record.ocean || record.terrain==='ocean')return {name:'океан',factor:0,ocean:true}
-  if(record.river || record.terrain==='river')return {name:'река',factor:Math.min(0.05,fdOptionNumber('riverExpansionFactor',0.05))}
+  if(record.river || record.terrain==='river')return {name:'река',factor:fdOptionNumber('riverControlFactor',0.5),
+    crossingChance:fdOptionNumber('riverExpansionFactor',0.2)}
   if(record.mountain || record.terrain==='mountain')return {name:'горы',factor:fdOptionNumber('peakExpansionFactor',0.35)}
   return {name:'обычная местность',factor:1.0}
+}
+
+function fdReadPersistentChunks(data,key) {
+  var count=Math.max(0,Number(data.getInt(key+'_parts') || 0))
+  if(count>0 && count<256) {
+    var result=''
+    for(var i=0;i<count;i++)result+=String(data.getString(key+'_'+i))
+    return result
+  }
+  return String(data.getString(key) || '')
+}
+
+function fdWritePersistentChunks(data,key,value) {
+  var chunkChars=12000,text=String(value || '')
+  var oldCount=Math.max(0,Number(data.getInt(key+'_parts') || 0))
+  var count=Math.ceil(text.length/chunkChars)
+  data.putString(key,'')
+  for(var i=0;i<count;i++)data.putString(key+'_'+i,text.slice(i*chunkChars,(i+1)*chunkChars))
+  for(var stale=count;stale<oldCount;stale++)data.putString(key+'_'+stale,'')
+  data.putInt(key+'_parts',count)
+}
+
+function fdReadTerrainSurvey(server) {
+  var survey={}
+  var encoded=fdReadPersistentChunks(server.persistentData,'front_cc_survey') ||
+    fdReadPersistentChunks(server.persistentData,'front_cc_terrain')
+  try {survey=JSON.parse(encoded || '{}')}catch(ignored){survey={}}
+  if(Object.keys(survey).length>0)return survey
+  try {
+    var snapshot=JSON.parse(fdReadPersistentChunks(server.persistentData,'front_cc_snapshot') || '{}')
+    if(snapshot && snapshot.terrain)survey=snapshot.terrain
+  } catch(ignoredSnapshot) {survey={}}
+  return survey
+}
+
+function fdApplyOrphanDecay() {
+  var connected={},queue=[]
+  for(var i=0;i<fdConfig.origins.length;i++) {
+    var sx=fdSX(fdConfig.origins[i].x),sz=fdSZ(fdConfig.origins[i].z),key=fdKey(sx,sz)
+    connected[key]=true
+    queue.push({sx:sx,sz:sz})
+  }
+  var dirs=[[1,0],[-1,0],[0,1],[0,-1]]
+  for(var q=0;q<queue.length;q++)for(var d=0;d<dirs.length;d++) {
+    var nx=queue[q].sx+dirs[d][0],nz=queue[q].sz+dirs[d][1],nk=fdKey(nx,nz)
+    if(connected[nk] || fdControl(nx,nz)<=0)continue
+    connected[nk]=true
+    queue.push({sx:nx,sz:nz})
+  }
+  var decay=fdOptionNumber('isolatedControlLossPerCycle',8)
+  Object.keys(fdState).forEach(key=>{
+    if(connected[key])return
+    var pair=key.split(','),sx=Number(pair[0]),sz=Number(pair[1])
+    fdSetControl(sx,sz,fdControl(sx,sz)-decay)
+  })
+  return connected
 }
 
 function fdApplyIsolation(server) {
@@ -596,13 +673,14 @@ function fdStrategicExpansion(server) {
   var level = fdWorld(server)
   var nearby = fdActiveSectors(server, level)
   var backgroundEnabled=fdConfig.backgroundExpansionEnabled!==false
-  var survey={}
-  try {survey=JSON.parse(String(server.persistentData.getString('front_cc_terrain')) || '{}')}catch(ignored){survey={}}
+  var survey=fdReadTerrainSurvey(server)
+  var originConnected=fdApplyOrphanDecay()
   var candidates = []
   var seen = {}
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
 
   Object.keys(fdState).forEach(key => {
+    if(!originConnected[key])return
     var pair = key.split(',')
     var sx = Number(pair[0])
     var sz = Number(pair[1])
@@ -627,7 +705,7 @@ function fdStrategicExpansion(server) {
     }
   })
 
-  if (candidates.length === 0) return
+  if (candidates.length === 0) {fdSave(server);return}
   candidates.sort((a, b) => Number(a.background)-Number(b.background) || fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz))
   var selected=[]
   var backgroundLimit=Math.max(0,Math.floor(fdOptionNumber('backgroundSectorsPerCycle',fdConfig.sectorsAdvancedPerCycle)))
@@ -642,8 +720,10 @@ function fdStrategicExpansion(server) {
     var candidate=selected[i]
     var terrain = candidate.background ? candidate.terrain : fdSectorTerrain(level, candidate.sx, candidate.sz)
     if (terrain.ocean) continue
-    // River crossings are rare attempts rather than a rounded minimum gain.
-    if (terrain.name === 'река' && Math.random() >= terrain.factor) continue
+    // A river delays creation of a bridgehead. Once control is above zero, the
+    // bridgehead grows at a reduced but useful rate instead of rolling forever.
+    var crossingChance=terrain.crossingChance==null?fdOptionNumber('riverExpansionFactor',0.2):Number(terrain.crossingChance)
+    if (terrain.name === 'река' && fdControl(candidate.sx,candidate.sz)<=0 && Math.random()>=crossingChance) continue
     var strategicGain = Math.max(1, Math.round(Number(fdConfig.expansionControlGain) *
       fdStrength(candidate.sx, candidate.sz) * terrain.factor))
     var candidateKey = fdKey(candidate.sx, candidate.sz)
@@ -716,6 +796,9 @@ function fdIsRobot(entity) {
   for (var r = 0; r < rare.length; r++) {
     if (id === String(rare[r])) return true
   }
+  var armor=fdHeavyArmorEntities()
+  for(var a=0;a<armor.length;a++)if(id===String(armor[a]))return true
+  if(id===String(fdConfig.ciwsEntity || 'crusty_chunks:ciws'))return true
   return entity.tags && entity.tags.contains && entity.tags.contains('fd_robot')
 }
 
@@ -910,6 +993,19 @@ function fdLoadedSurface(level, x, z) {
   return y
 }
 
+function fdLoadedHeavySurface(level,x,z) {
+  var center=fdLoadedSurface(level,x,z)
+  if(center==null)return null
+  var offsets=[-2,0,2]
+  for(var ix=0;ix<offsets.length;ix++)for(var iz=0;iz<offsets.length;iz++) {
+    var px=x+offsets[ix],pz=z+offsets[iz]
+    var surface=fdLoadedSurface(level,px,pz)
+    if(surface==null || Math.abs(surface-center)>1)return null
+    for(var h=0;h<5;h++)if(!level.getBlockState(new FD_BlockPos(px,center+h,pz)).isAir())return null
+  }
+  return center
+}
+
 function fdIsCitySector(level, sx, sz) {
   var key = fdKey(sx, sz)
   if (fdCityCache[key] != null) return fdCityCache[key]
@@ -951,6 +1047,8 @@ function fdSpawnRobot(server, level, sx, sz, anchor, forcedType) {
   if (fdSectorTerrain(level, sx, sz).ocean) return false
     var size = fdZoneSize()
     var margin = Math.min(20,Math.max(1,Math.floor(size/4)))
+    var types = fdConfig.robotEntities
+    var type = forcedType || String(types[Math.floor(Math.random() * types.length)])
   for (var attempt = 0; attempt < Number(fdConfig.surfaceAttempts); attempt++) {
     var x
     var z
@@ -965,11 +1063,9 @@ function fdSpawnRobot(server, level, sx, sz, anchor, forcedType) {
       z = sz * size + margin + Math.floor(Math.random() * (size - margin * 2))
     }
     if (fdInSafeZone(x, z)) continue
-    var y = fdLoadedSurface(level, x, z)
+    var y = fdIsHeavyArmorType(type)?fdLoadedHeavySurface(level,x,z):fdLoadedSurface(level,x,z)
     if (y == null) continue
 
-    var types = fdConfig.robotEntities
-    var type = forcedType || String(types[Math.floor(Math.random() * types.length)])
     var spawnY = fdIsAircraftType(type) ? y + fdOptionNumber('aircraftSpawnHeight', 28) : y
     fdCmd(server, `execute in minecraft:overworld run summon ${type} ${x} ${spawnY} ${z} {Tags:["fd_robot","fd_front_unit"],PersistenceRequired:1b}`)
     return { x: x, z: z }
@@ -1467,13 +1563,18 @@ function fdUpdateLocalFront(server) {
   var level = fdWorld(server)
   var active = fdActiveSectors(server, level)
   var parentCounts={}
+  var parentHeavyCounts={}
+  var parentCiwsCounts={}
 
   Object.keys(active).forEach(key => {
     var activeSector = active[key]
     var parentKey=fdMajorKey(activeSector.sx,activeSector.sz)
     var parentPair=parentKey.split(','),majorSize=Number(fdConfig.sectorSize)
     if(parentCounts[parentKey]==null) {
-      parentCounts[parentKey]=fdCount(server,`@e[tag=fd_robot,x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}]`)
+      var parentBox=`x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}`
+      parentCounts[parentKey]=fdCount(server,`@e[tag=fd_robot,${parentBox}]`)
+      parentHeavyCounts[parentKey]=fdCountEntityTypes(server,fdHeavyArmorEntities(),parentBox)
+      parentCiwsCounts[parentKey]=fdCount(server,`@e[type=${String(fdConfig.ciwsEntity || 'crusty_chunks:ciws')},tag=fd_robot,${parentBox}]`)
     }
     var control = fdControl(activeSector.sx, activeSector.sz)
     var frontSector = fdIsFrontier(activeSector.sx, activeSector.sz)
@@ -1519,6 +1620,8 @@ function fdUpdateLocalFront(server) {
     for (var i = 0; i < wave; i++) {
       var forcedType = fdInfantryType()
       var rareSupport = false
+      var heavyArmor = false
+      var ciwsSupport = false
       var guaranteedMortar=missingSiegeMortars>0
       if (guaranteedMortar) {
         forcedType = 'crusty_chunks:mortarer'
@@ -1530,15 +1633,27 @@ function fdUpdateLocalFront(server) {
         forcedType = fdRandomFrom(fdConfig.rareSupportEntities, 'crusty_chunks:hunter')
         rareSupport = true
         rarePresent = true
+      } else if (frontSector && updated>=fdOptionNumber('heavyArmorMinimumControl',55) &&
+          parentHeavyCounts[parentKey]<fdOptionNumber('heavyArmorMaxPerMajorSector',1) &&
+          Math.random()<fdOptionNumber('heavyArmorChancePerUnit',0.03)) {
+        forcedType=fdRandomFrom(fdHeavyArmorEntities(),'crusty_chunks:decimator_hull')
+        heavyArmor=true
+      } else if (updated>=fdOptionNumber('ciwsMinimumControl',60) &&
+          parentCiwsCounts[parentKey]<fdOptionNumber('ciwsMaxPerMajorSector',1) &&
+          Math.random()<fdOptionNumber('ciwsChancePerUnit',0.02)) {
+        forcedType=String(fdConfig.ciwsEntity || 'crusty_chunks:ciws')
+        ciwsSupport=true
       } else if (Math.random() < fdOptionNumber('mortarChancePerUnit', 0.025)) {
         forcedType = 'crusty_chunks:mortarer'
       } else if (Math.random() < fdOptionNumber('supportChancePerUnit', 0.18)) {
         forcedType = fdSupportType()
       }
-      var spawnedAt = fdSpawnRobot(server, level, activeSector.sx, activeSector.sz, squadAnchor, forcedType)
+      var spawnedAt = fdSpawnRobot(server, level, activeSector.sx, activeSector.sz,heavyArmor?null:squadAnchor,forcedType)
       if(spawnedAt) {
         parentCounts[parentKey]++
         if(guaranteedMortar)missingSiegeMortars--
+        if(heavyArmor)parentHeavyCounts[parentKey]++
+        if(ciwsSupport)parentCiwsCounts[parentKey]++
       }
       if (rareSupport && spawnedAt) {
         fdCmd(server, `tag @e[type=${forcedType},tag=fd_robot,sort=nearest,limit=1,x=${spawnedAt.x},z=${spawnedAt.z},distance=..24] add fd_rare_support`)
@@ -1654,14 +1769,14 @@ function fwLoad(server) {
   var storage='front_services_v9_'+fdZoneSize()
   if(fwData && fwStoreKey===storage) return
   fwStoreKey=storage
-  try { fwData=JSON.parse(String(server.persistentData.getString(storage)) || '{}') } catch(ignored) { fwData={} }
+  try { fwData=JSON.parse(fdReadPersistentChunks(server.persistentData,storage) || '{}') } catch(ignored) { fwData={} }
   if(!fwData.mail)fwData.mail=[]
   if(!fwData.defence)fwData.defence={}
   if(!fwData.missions)fwData.missions={}
   if(!fwData.effects)fwData.effects={}
   if(!fwData.cooldowns)fwData.cooldowns={}
 }
-function fwSave(server) { server.persistentData.putString(fwStoreKey,JSON.stringify(fwData)) }
+function fwSave(server) { fdWritePersistentChunks(server.persistentData,fwStoreKey,JSON.stringify(fwData)) }
 function fwMail(server,zone,kind) {
   fwLoad(server)
   var now=fdGameTime(server)
