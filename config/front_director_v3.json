@@ -4,7 +4,8 @@
   "sectorSize": 256,
   "origins": [
     { "name": "North", "x": 3391, "z": -1249 },
-    { "name": "West", "x": 2552, "z": 40 }
+    { "name": "West", "x": 2552, "z": 40 },
+    { "name": "East", "x": 4638, "z": 1139 } 
   ],
   "warAreas": [
     { "name": "War", "x1": -656, "z1": -1610, "x2": 4688, "z2": 2697 }
