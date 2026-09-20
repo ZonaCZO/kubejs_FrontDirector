@@ -1791,7 +1791,7 @@ EntityEvents.spawned(event => {
     return
   }
   if (!fdIsRobot(entity)) return
-  if (!entity.getTags().contains('fd_robot')) {
+  if (!entity.getTags().contains('fd_robot') && !entity.getTags().contains('fd_allow_manual')) {
     event.cancel()
     return
   }

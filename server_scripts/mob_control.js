@@ -82,10 +82,25 @@ function mcInSafeZone(entity) {
   return false
 }
 
+// A spawn egg is an explicit map-maker/admin action, not ambient spawning.
+// Mark the entity before EntityEvents.spawned fires so both Mob Control and
+// Front Director can distinguish it from Warium's native automatic spawns.
+EntityEvents.checkSpawn(event => {
+  if (String(event.type) !== 'SPAWN_EGG') return
+  try { event.entity.addTag('fd_allow_manual') } catch (ignored) {}
+})
+
 EntityEvents.spawned(event => {
   const entity = event.entity
   const id = mcEntityId(entity)
   if (!id) return
+
+  const manuallyPlaced = mcHasTag(entity, 'fd_allow_manual')
+
+  // Creative spawn eggs deliberately override the pack's ambient-spawn
+  // blacklists and safe-zone filter. The tag remains on the entity so the
+  // periodic faction cleanup does not remove it later.
+  if (manuallyPlaced) return
 
   if (MC_BLOCKED_FACTION_UNITS[id]) {
     event.cancel()
@@ -107,14 +122,14 @@ EntityEvents.spawned(event => {
   // Never filter Warium bullets, rockets, particles, ragdolls or other effects.
   // Only IDs listed as robots in the Front Director config are controlled.
   mcLoadConfig()
-  if (MC_RARE_SUPPORT[id] && !mcHasTag(entity, 'fd_robot') && !mcHasTag(entity, 'fd_allow_manual')) {
+  if (MC_RARE_SUPPORT[id] && !mcHasTag(entity, 'fd_robot')) {
   event.cancel()
   return
 }
 
   if (!mcRobotIds[id]) return
 
-  // No robot may appear inside a configured safe zone, including commands/eggs.
+  // Automatic robots may never appear inside a configured safe zone.
   if (mcInSafeZone(entity)) {
     event.cancel()
     return
@@ -122,8 +137,8 @@ EntityEvents.spawned(event => {
 
 
   // Only robots summoned and tagged by Front Director are accepted.
-  // Add tag fd_allow_manual to NBT when a map maker intentionally places one.
-  if (!mcHasTag(entity, 'fd_robot') && !mcHasTag(entity, 'fd_allow_manual')) {
+  // Commands can opt in with {Tags:["fd_allow_manual"]}.
+  if (!mcHasTag(entity, 'fd_robot')) {
     event.cancel()
   }
 })
@@ -136,7 +151,7 @@ ServerEvents.tick(event => {
   var iterator = event.server.overworld().getAllEntities().iterator()
   while (iterator.hasNext()) {
     var cleanupEntity = iterator.next()
-    if (!MC_BLOCKED_FACTION_UNITS[mcEntityId(cleanupEntity)]) continue
+    if (!MC_BLOCKED_FACTION_UNITS[mcEntityId(cleanupEntity)] || mcHasTag(cleanupEntity, 'fd_allow_manual')) continue
     try { cleanupEntity.discard() } catch (ignored) { cleanupEntity.remove('discarded') }
   }
 })
