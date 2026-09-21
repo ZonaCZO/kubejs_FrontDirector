@@ -88,6 +88,18 @@ NetworkEvents.dataReceived('front:admin_ui_request',event=>{
    fdStrategicExpansion(s)
    fdExpansionClock=Number(fdConfig.expansionIntervalMinutes)*60*20
    p.tell('[Штаб] Выполнен один стратегический ход противника.')
+  }else if(a==='breakthrough_limited'||a==='breakthrough_normal'||a==='breakthrough_major'){
+   if(String(p.level.dimension)!=='minecraft:overworld')throw Error('Для выбора направления прорыва находись в обычном мире.')
+   var strength=a.substring('breakthrough_'.length)
+   var result=fdStartBreakthrough(s,fdSX(p.x),fdSZ(p.z),strength,true)
+   if(!result.ok)throw Error(result.message)
+   p.tell('[Штаб] '+result.message)
+  }else if(a==='breakthrough_cancel'){
+   if(!fdCancelBreakthrough(s))throw Error('Активного прорыва нет.')
+  }else if(a==='breakthrough_auto'){
+   var automatic=!fdBreakthroughAutoEnabled(s)
+   fdSetBreakthroughAuto(s,automatic)
+   p.tell('[Штаб] Автоматические прорывы: '+(automatic?'включены.':'выключены.'))
   }else if(a==='control_plus'||a==='control_minus'){
    var sx=fdSX(p.x),sz=fdSZ(p.z)
    if(String(p.level.dimension)!=='minecraft:overworld'||!fdAllowedSector(sx,sz))throw Error('Встань в доступную боевую зону, не в безопасную территорию.')

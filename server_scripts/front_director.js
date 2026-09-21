@@ -280,6 +280,10 @@ function fdLoadConfig(server) {
   })
   var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64],
     backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64],
+    breakthroughPreparationMinutes:[0.25,30],breakthroughAssaultMinutes:[1,60],
+    breakthroughCooldownMinutes:[1,240],breakthroughMaxDepth:[1,8],breakthroughLossLimit:[1,128],
+    breakthroughControlMultiplier:[1,5],breakthroughCapMultiplier:[1,3],
+    breakthroughExtraBatch:[0,12],breakthroughAbsoluteCapBonus:[0,32],breakthroughRiverChanceMultiplier:[1,5],
     heavyArmorChancePerUnit:[0,1],heavyArmorMinimumControl:[0,100],heavyArmorMaxPerMajorSector:[0,8],
     riverExpansionFactor:[0,1],riverControlFactor:[0.05,1],
     aiCommandRadiusBlocks:[64,768],aiCommandIntervalTicks:[20,200],aiBatchSize:[1,64],
@@ -341,6 +345,8 @@ function fdOpsLoad(server) {
   if (!fdOps.protection) fdOps.protection = {}
   if (!fdOps.garrisons) fdOps.garrisons = {}
   if (!fdOps.alerts) fdOps.alerts = {}
+  if (!fdOps.breakthrough) fdOps.breakthrough = null
+  if (!fdOps.breakthroughCooldownUntil) fdOps.breakthroughCooldownUntil = 0
   if(!migrated) {
     fdOps.liberated=fdExpandLegacy(fdOps.liberated)
     fdOps.protection=fdExpandLegacy(fdOps.protection)
@@ -769,26 +775,34 @@ function fdStrategicExpansion(server) {
   })
 
   if (candidates.length === 0) {fdSave(server);return}
-  candidates.sort((a, b) => Number(a.background)-Number(b.background) || fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz))
-  var selected=[]
+  var breakthrough=fdBreakthroughOperation()
+  candidates.sort((a, b) => {
+    var aBreak=breakthrough && breakthrough.phase==='assault' && a.sx===Number(breakthrough.sx) && a.sz===Number(breakthrough.sz)?0:1
+    var bBreak=breakthrough && breakthrough.phase==='assault' && b.sx===Number(breakthrough.sx) && b.sz===Number(breakthrough.sz)?0:1
+    return aBreak-bBreak || Number(a.background)-Number(b.background) || fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz)
+  })
+  var advanceLimit=Math.max(0,Math.floor(Number(fdConfig.sectorsAdvancedPerCycle)))
   var backgroundLimit=Math.max(0,Math.floor(fdOptionNumber('backgroundSectorsPerCycle',fdConfig.sectorsAdvancedPerCycle)))
   var backgroundUsed=0
-  for(var c=0;c<candidates.length && selected.length<Number(fdConfig.sectorsAdvancedPerCycle);c++) {
-    if(candidates[c].background && backgroundUsed>=backgroundLimit)continue
-    selected.push(candidates[c])
-    if(candidates[c].background)backgroundUsed++
-  }
-
-  for (var i = 0; i < selected.length; i++) {
-    var candidate=selected[i]
+  var advanced=0
+  // Keep looking until the configured number of sectors actually advanced.
+  // Previously an ocean, a failed river crossing or a defended sector still
+  // occupied one of the few selections for this cycle. The same nearest
+  // blocked candidates could therefore make the whole front appear frozen.
+  for (var i = 0; i < candidates.length && advanced < advanceLimit; i++) {
+    var candidate=candidates[i]
+    if(candidate.background && backgroundUsed>=backgroundLimit)continue
     var terrain = candidate.background ? candidate.terrain : fdSectorTerrain(level, candidate.sx, candidate.sz)
     if (terrain.ocean) continue
     // A river delays creation of a bridgehead. Once control is above zero, the
     // bridgehead grows at a reduced but useful rate instead of rolling forever.
+    var breakthroughTarget=breakthrough && breakthrough.phase==='assault' && candidate.sx===Number(breakthrough.sx) && candidate.sz===Number(breakthrough.sz)
     var crossingChance=terrain.crossingChance==null?fdOptionNumber('riverExpansionFactor',0.2):Number(terrain.crossingChance)
+    if(breakthroughTarget)crossingChance=Math.min(1,crossingChance*fdOptionNumber('breakthroughRiverChanceMultiplier',2))
     if (terrain.name === 'река' && fdControl(candidate.sx,candidate.sz)<=0 && Math.random()>=crossingChance) continue
     var strategicGain = Math.max(1, Math.round(Number(fdConfig.expansionControlGain) *
       fdStrength(candidate.sx, candidate.sz) * terrain.factor))
+    if(breakthroughTarget)strategicGain=Math.max(1,Math.round(strategicGain*fdBreakthroughSettings(breakthrough.strength).gainMultiplier))
     var candidateKey = fdKey(candidate.sx, candidate.sz)
     var garrison = fdOps.garrisons[fdMajorKey(candidate.sx,candidate.sz)]
     if (garrison && Number(garrison.strength) > 0) {
@@ -802,6 +816,8 @@ function fdStrategicExpansion(server) {
     if(strategicGain<=0)continue
     var oldControl=fdControl(candidate.sx,candidate.sz)
     fdSetControl(candidate.sx, candidate.sz,fdControl(candidate.sx, candidate.sz) + strategicGain)
+    advanced++
+    if(candidate.background)backgroundUsed++
     if(oldControl===0 && fdControl(candidate.sx,candidate.sz)>0) fwMail(server,candidateKey,'advance')
   }
   fdSave(server)
@@ -964,6 +980,186 @@ function fdWaveRole(frontSector,control,missingMortar) {
   return 'assault'
 }
 
+function fdBreakthroughAutoEnabled(server) {
+  if(!server.persistentData.getBoolean('front_breakthrough_auto_initialized')) {
+    server.persistentData.putBoolean('front_breakthrough_auto_initialized',true)
+    server.persistentData.putBoolean('front_breakthrough_auto',fdConfig.breakthroughAutomatic!==false)
+  }
+  return server.persistentData.getBoolean('front_breakthrough_auto')
+}
+
+function fdSetBreakthroughAuto(server,enabled) {
+  server.persistentData.putBoolean('front_breakthrough_auto_initialized',true)
+  server.persistentData.putBoolean('front_breakthrough_auto',Boolean(enabled))
+}
+
+function fdBreakthroughSettings(strength) {
+  var kind=['limited','normal','major'].indexOf(String(strength))>=0?String(strength):'normal'
+  var baseDepth=Math.max(1,Math.floor(fdOptionNumber('breakthroughMaxDepth',3)))
+  var baseLoss=Math.max(1,Math.floor(fdOptionNumber('breakthroughLossLimit',14)))
+  var baseGain=Math.max(1,fdOptionNumber('breakthroughControlMultiplier',2))
+  var baseCap=Math.max(1,fdOptionNumber('breakthroughCapMultiplier',1.5))
+  var baseBatch=Math.max(0,Math.floor(fdOptionNumber('breakthroughExtraBatch',2)))
+  var baseAbsolute=Math.max(0,Math.floor(fdOptionNumber('breakthroughAbsoluteCapBonus',4)))
+  if(kind==='limited')return {kind:kind,maxDepth:Math.min(2,baseDepth),lossLimit:Math.max(6,baseLoss-4),
+    gainMultiplier:Math.max(1,baseGain*0.75),capMultiplier:Math.max(1.1,baseCap-0.25),extraBatch:Math.max(1,baseBatch-1),
+    absoluteBonus:Math.max(1,baseAbsolute-2),guaranteedHeavy:false}
+  if(kind==='major')return {kind:kind,maxDepth:baseDepth,lossLimit:baseLoss+4,
+    gainMultiplier:Math.min(5,baseGain*1.25),capMultiplier:Math.min(3,baseCap+0.25),extraBatch:baseBatch+1,
+    absoluteBonus:baseAbsolute+2,guaranteedHeavy:true}
+  return {kind:'normal',maxDepth:baseDepth,lossLimit:baseLoss,gainMultiplier:baseGain,
+    capMultiplier:baseCap,extraBatch:baseBatch,absoluteBonus:baseAbsolute,guaranteedHeavy:true}
+}
+
+function fdBreakthroughOperation() {
+  var operation=fdOps ? fdOps.breakthrough : null
+  return operation && (operation.phase==='preparing' || operation.phase==='assault') ? operation : null
+}
+
+function fdBreakthroughForSector(sx,sz) {
+  var operation=fdBreakthroughOperation()
+  return operation && Number(operation.sx)===Number(sx) && Number(operation.sz)===Number(sz)?operation:null
+}
+
+function fdBreakthroughResolveTarget(level,sx,sz) {
+  if(!fdAllowedSector(sx,sz))return null
+  var dirs=[[1,0],[-1,0],[0,1],[0,-1]],control=fdControl(sx,sz),best=null
+  if(control<100) {
+    for(var i=0;i<dirs.length;i++) {
+      var sourceControl=fdControl(sx-dirs[i][0],sz-dirs[i][1])
+      if(sourceControl<Number(fdConfig.expansionSourceControl))continue
+      if(best==null || sourceControl>best.sourceControl)best={sx:sx,sz:sz,dx:dirs[i][0],dz:dirs[i][1],sourceControl:sourceControl}
+    }
+  } else if(control>=Number(fdConfig.expansionSourceControl)) {
+    for(var d=0;d<dirs.length;d++) {
+      var nx=sx+dirs[d][0],nz=sz+dirs[d][1],nextControl=fdControl(nx,nz)
+      if(!fdAllowedSector(nx,nz) || nextControl>=100)continue
+      if(best==null || nextControl<best.targetControl)best={sx:nx,sz:nz,dx:dirs[d][0],dz:dirs[d][1],sourceControl:control,targetControl:nextControl}
+    }
+  }
+  if(best==null)return null
+  var terrain=fdSectorTerrain(level,best.sx,best.sz)
+  return terrain.ocean?null:best
+}
+
+function fdStartBreakthrough(server,sx,sz,strength,manual) {
+  if(fdConfig.breakthroughEnabled===false)return {ok:false,message:'Механика прорыва отключена в конфиге.'}
+  if(fdBreakthroughOperation())return {ok:false,message:'Уже выполняется другая операция прорыва.'}
+  var now=fdGameTime(server)
+  if(!manual && Number(fdOps.breakthroughCooldownUntil || 0)>now)return {ok:false,message:'Войска ещё восстанавливаются после прошлого прорыва.'}
+  var target=fdBreakthroughResolveTarget(fdWorld(server),sx,sz)
+  if(target==null)return {ok:false,message:'Здесь нет доступного сухопутного направления для прорыва.'}
+  var settings=fdBreakthroughSettings(strength)
+  fdOps.breakthrough={phase:'preparing',sx:target.sx,sz:target.sz,dx:target.dx,dz:target.dz,
+    strength:settings.kind,depth:0,maxDepth:settings.maxDepth,losses:0,lossLimit:settings.lossLimit,
+    started:now,phaseEnds:now+Math.max(300,Math.floor(fdOptionNumber('breakthroughPreparationMinutes',3)*1200)),manual:Boolean(manual)}
+  fdOpsDirty=true
+  fdOpsSave(server)
+  var zone=fdKey(target.sx,target.sz)
+  fwMail(server,zone,'breakthrough_prepare')
+  fdTell(server,'Разведка сообщает о концентрации сил противника в зоне '+zone+'. Готовится прорыв.','red')
+  return {ok:true,message:'Подготовка прорыва началась в зоне '+zone+'.'}
+}
+
+function fdFinishBreakthrough(server,result,reason) {
+  var operation=fdBreakthroughOperation()
+  if(!operation)return
+  var zone=fdKey(operation.sx,operation.sz),now=fdGameTime(server)
+  fdOps.breakthrough=null
+  fdOps.breakthroughCooldownUntil=now+Math.max(1200,Math.floor(fdOptionNumber('breakthroughCooldownMinutes',30)*1200))
+  fdOpsDirty=true
+  fdOpsSave(server)
+  fwMail(server,zone,result==='success'?'breakthrough_success':'breakthrough_failed')
+  fdTell(server,(result==='success'?'Операция прорыва завершена':'Операция прорыва сорвана')+
+    ' в районе '+zone+(reason?' — '+reason:'')+'.','gold')
+}
+
+function fdCancelBreakthrough(server) {
+  if(!fdBreakthroughOperation())return false
+  fdFinishBreakthrough(server,'failed','отменена командованием')
+  return true
+}
+
+function fdBreakthroughTerrain(server,sx,sz) {
+  var level=fdWorld(server),center=fdSectorCenter(sx,sz)
+  if(level.getChunkSource().hasChunk(Math.floor(center.x)>>4,Math.floor(center.z)>>4))return fdSectorTerrain(level,sx,sz)
+  return fdBackgroundTerrain(server,level,sx,sz,fdReadTerrainSurvey(server))
+}
+
+function fdBreakthroughTick(server) {
+  var operation=fdBreakthroughOperation()
+  if(!operation)return
+  var now=fdGameTime(server)
+  if(operation.phase==='preparing' && now>=Number(operation.phaseEnds)) {
+    operation.phase='assault'
+    operation.phaseEnds=now+Math.max(1200,Math.floor(fdOptionNumber('breakthroughAssaultMinutes',12)*1200))
+    fdOpsDirty=true;fdOpsSave(server)
+    fwMail(server,fdKey(operation.sx,operation.sz),'breakthrough_assault')
+    fdTell(server,'Противник начал прорыв в зоне '+fdKey(operation.sx,operation.sz)+'.','dark_red')
+    return
+  }
+  if(operation.phase!=='assault')return
+  if(Number(operation.losses)>=Number(operation.lossLimit)) {
+    fdFinishBreakthrough(server,'failed','ударная группа понесла критические потери')
+    return
+  }
+  if(fdControl(operation.sx,operation.sz)>=100) {
+    operation.depth=Number(operation.depth)+1
+    if(Number(operation.depth)>=Number(operation.maxDepth)) {
+      fdFinishBreakthrough(server,'success','достигнута предельная глубина')
+      return
+    }
+    var nx=Number(operation.sx),nz=Number(operation.sz),terrain=null,advanceSteps=0
+    do {
+      nx+=Number(operation.dx);nz+=Number(operation.dz);advanceSteps++
+      terrain=fdAllowedSector(nx,nz)?fdBreakthroughTerrain(server,nx,nz):null
+      if(terrain==null || terrain.ocean || fdInSafeZone((nx+0.5)*fdZoneSize(),(nz+0.5)*fdZoneSize())) {
+        fdFinishBreakthrough(server,'success','дальнейшее продвижение остановлено местностью')
+        return
+      }
+    } while(fdControl(nx,nz)>=100 && advanceSteps<32)
+    if(advanceSteps>=32 && fdControl(nx,nz)>=100) {
+      fdFinishBreakthrough(server,'success','ударная группа соединилась с контролируемой территорией')
+      return
+    }
+    operation.sx=nx;operation.sz=nz
+    fdOpsDirty=true;fdOpsSave(server)
+    fwMail(server,fdKey(nx,nz),'breakthrough_assault')
+    fdTell(server,'Ударная группа развивает успех в направлении зоны '+fdKey(nx,nz)+'.','red')
+  }
+  if(fdBreakthroughOperation() && now>=Number(operation.phaseEnds))
+    fdFinishBreakthrough(server,Number(operation.depth)>0?'success':'failed','наступательный потенциал исчерпан')
+}
+
+function fdBreakthroughMaybeAuto(server) {
+  if(fdConfig.breakthroughEnabled===false || !fdBreakthroughAutoEnabled(server) || fdBreakthroughOperation())return
+  var now=fdGameTime(server)
+  if(!server.persistentData.getBoolean('front_breakthrough_clock_initialized')) {
+    server.persistentData.putBoolean('front_breakthrough_clock_initialized',true)
+    fdOps.breakthroughCooldownUntil=now+Math.max(1200,Math.floor(fdOptionNumber('breakthroughCooldownMinutes',30)*1200))
+    fdOpsDirty=true;fdOpsSave(server);return
+  }
+  if(Number(fdOps.breakthroughCooldownUntil || 0)>now)return
+  var level=fdWorld(server),active=fdActiveSectors(server,level),options=[]
+  Object.keys(active).forEach(key=>{
+    var sector=active[key],target=fdBreakthroughResolveTarget(level,sector.sx,sector.sz)
+    if(target!=null)options.push(sector)
+  })
+  if(options.length===0)return
+  var selected=options[Math.floor(Math.random()*options.length)]
+  fdStartBreakthrough(server,selected.sx,selected.sz,'normal',false)
+}
+
+function fdBreakthroughRecordLoss(server,entity) {
+  var operation=fdBreakthroughForSector(fdSX(entity.x),fdSZ(entity.z))
+  if(!operation || operation.phase!=='assault')return
+  var id=fdEntityId(entity),loss=1
+  if(fdIsHeavyArmorType(id))loss=5
+  else if(id==='crusty_chunks:commander')loss=3
+  operation.losses=Number(operation.losses || 0)+loss
+  fdOpsDirty=true
+}
+
 function fdTextHash(value) {
   var hash=0
   for(var i=0;i<value.length;i++)hash=((hash*31)+value.charCodeAt(i))|0
@@ -1032,6 +1228,7 @@ function fdAdvanceDestination(level, robot) {
   var sz = fdSZ(robot.z)
   var currentControl = fdControl(sx, sz)
   if(currentControl<Number(fdConfig.expansionSourceControl))return fdRallyDestination(level,robot,sx,sz,currentControl)
+  var breakthrough=fdBreakthroughForSector(sx,sz)
 
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
   var best = null
@@ -1045,6 +1242,7 @@ function fdAdvanceDestination(level, robot) {
     var terrain = fdSectorTerrain(level, nx, nz)
     if(terrain.ocean)continue
     var score = (currentControl - neighborControl) * 10 + fdNearestOriginDistance(nx, nz) / 256
+    if(breakthrough && breakthrough.phase==='assault' && dirs[i][0]===Number(breakthrough.dx) && dirs[i][1]===Number(breakthrough.dz))score+=100000
     score -= (1.0 - terrain.factor) * fdOptionNumber('terrainPathPenalty', 500)
     if (score > bestScore) {
       bestScore = score
@@ -1367,7 +1565,7 @@ global.frontMapBuild = function(server) {
     x:Number(fdConfig.origins[i].x),z:Number(fdConfig.origins[i].z)})
   return JSON.stringify({version: 1, sector_size: fdZoneSize(),major_sector_size:Number(fdConfig.sectorSize),
     enemy: fdEnemyName(server), areas: rectangles(fdConfig.warAreas), safe_zones: rectangles(fdConfig.safeZones),
-    origins: origins, controls: fdState, garrisons: fdOps.garrisons})
+    origins: origins, controls: fdState, garrisons: fdOps.garrisons, breakthrough:fdOps.breakthrough || null})
 }
 
 function fdStateName(player) {
@@ -1510,6 +1708,9 @@ function fdHqPayload(server, player) {
   var key = fdMajorKey(sx, sz)
   var terrain = fdSectorTerrain(fdWorld(server), sx, sz)
   var garrison = fdOps.garrisons[key]
+  var breakthrough=fdBreakthroughOperation(),now=fdGameTime(server)
+  var breakthroughPhase=breakthrough?String(breakthrough.phase):(Number(fdOps.breakthroughCooldownUntil || 0)>now?'cooldown':'idle')
+  var breakthroughEnds=breakthrough?Number(breakthrough.phaseEnds):Number(fdOps.breakthroughCooldownUntil || 0)
   var zone = !fdInWarArea(player.x, player.z) ? 'Вне театра войны' :
     (fdInSafeZone(player.x, player.z) ? 'Безопасная зона' :
       (fdIsFrontier(sx, sz) ? 'Линия фронта' : (control > 0 ? 'Территория Warium' : 'Свободный сектор')))
@@ -1517,6 +1718,11 @@ function fdHqPayload(server, player) {
     role: String(player.persistentData.getString('front_rp_role') || ''),
     warPaused:server.persistentData.getBoolean('front_gm_paused'),
     warPace:fdWarPace(server),
+    breakthroughAuto:fdBreakthroughAutoEnabled(server),breakthroughPhase:breakthroughPhase,
+    breakthroughZone:breakthrough?fdKey(breakthrough.sx,breakthrough.sz):'',breakthroughStrength:breakthrough?String(breakthrough.strength):'',
+    breakthroughDepth:breakthrough?Number(breakthrough.depth):0,breakthroughMaxDepth:breakthrough?Number(breakthrough.maxDepth):0,
+    breakthroughLosses:breakthrough?Number(breakthrough.losses):0,breakthroughLossLimit:breakthrough?Number(breakthrough.lossLimit):0,
+    breakthroughMinutes:Math.max(0,Math.ceil((breakthroughEnds-now)/1200)),
     callsign: String(player.persistentData.getString('front_rp_callsign') || ''),
     flag: String(player.persistentData.getString('front_rp_flag') || ''),
     enemyName: fdEnemyName(server), language: String(player.persistentData.getString('front_language') || 'ru'),
@@ -1708,7 +1914,8 @@ function fdResetWar(context) {
   for (var i = 0; i < fdConfig.origins.length; i++) {
     fdSetControl(fdSX(fdConfig.origins[i].x), fdSZ(fdConfig.origins[i].z), 100)
   }
-  fdOps = { liberated: {}, protection: {}, garrisons: {}, alerts: {} }
+  fdOps = { liberated: {}, protection: {}, garrisons: {}, alerts: {}, breakthrough:null, breakthroughCooldownUntil:0 }
+  server.persistentData.putBoolean('front_breakthrough_clock_initialized',false)
   fwLoad(server)
   fwData={mail:[],defence:{},missions:{},effects:{},cooldowns:{}}
   fwSave(server)
@@ -1799,6 +2006,8 @@ function fdUpdateLocalFront(server) {
     var strength = fdStrength(activeSector.sx, activeSector.sz)
     var citySector = fdIsCitySector(level, activeSector.sx, activeSector.sz)
     var settlementSector = citySector || fdIsSettlementSector(level, activeSector.sx, activeSector.sz)
+    var breakthrough=fdBreakthroughForSector(activeSector.sx,activeSector.sz)
+    var breakthroughSettings=breakthrough?fdBreakthroughSettings(breakthrough.strength):null
     var mortarSuppressed = fwMissionEffect(server, fdKey(activeSector.sx,activeSector.sz), 'mortar')
     var requiredMortars = frontSector && settlementSector && !mortarSuppressed ? Math.floor(fdOptionNumber('siegeMortarMinimum',1)) : 0
     var mortarCount = requiredMortars > 0 ? fdCount(server,`@e[type=crusty_chunks:mortarer,tag=fd_robot,x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}]`) : 0
@@ -1809,6 +2018,11 @@ function fdUpdateLocalFront(server) {
     var rearBaseCap = fdOptionNumber('rearGarrisonCapPerSector', 8)
     var selectedBaseCap = frontSector ? frontBaseCap : rearBaseCap
     var absoluteCap=Number(fdConfig.absoluteRobotCapPerSector)
+    if(breakthroughSettings) {
+      var phaseCapMultiplier=breakthrough.phase==='assault'?breakthroughSettings.capMultiplier:1+(breakthroughSettings.capMultiplier-1)*0.5
+      selectedBaseCap*=phaseCapMultiplier
+      absoluteCap+=breakthroughSettings.absoluteBonus
+    }
     var cap = Math.min(absoluteCap+missingSiegeMortars,
       Math.round(selectedBaseCap * strength * cityMultiplier + (frontSector ? resistanceBonus : 0)))
     if(missingSiegeMortars>0)cap=Math.max(cap,Math.min(robots+missingSiegeMortars,absoluteCap+missingSiegeMortars))
@@ -1816,13 +2030,15 @@ function fdUpdateLocalFront(server) {
     if (robots >= cap) return
     var selectedBatch = frontSector ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) :
       Math.max(fdOptionNumber('gendarmerieSquadMinimumSize',2),fdOptionNumber('rearSpawnBatch',2))
+    if(breakthroughSettings)selectedBatch+=breakthrough.phase==='assault'?breakthroughSettings.extraBatch:Math.max(1,Math.floor(breakthroughSettings.extraBatch/2))
     var wave = Math.min(selectedBatch, cap - robots,
       Math.max(0,absoluteCap+missingSiegeMortars-parentCounts[parentKey]))
     if(wave<=0) return
-    var waveRole=fdWaveRole(frontSector,updated,missingSiegeMortars)
+    var waveRole=breakthrough?'assault':fdWaveRole(frontSector,updated,missingSiegeMortars)
     var squadTag=fdNewSquadTag(server,waveRole)
     var squadAnchor = null
     var rarePresent = fdCount(server, `@e[tag=fd_rare_support,${fdSectorBox(activeSector.sx, activeSector.sz)}]`) > 0
+    var breakthroughHeavyMissing=breakthrough && breakthrough.phase==='assault' && breakthroughSettings.guaranteedHeavy && parentHeavyCounts[parentKey]<1
     for (var i = 0; i < wave; i++) {
       var forcedType = fdRoleInfantryType(waveRole)
       var rareSupport = false
@@ -1831,6 +2047,9 @@ function fdUpdateLocalFront(server) {
       var guaranteedMortar=missingSiegeMortars>0
       if (guaranteedMortar) {
         forcedType = 'crusty_chunks:mortarer'
+      } else if(breakthroughHeavyMissing && i===0) {
+        forcedType=fdRandomFrom(fdHeavyArmorEntities(),'crusty_chunks:decimator_hull')
+        heavyArmor=true
       } else if (waveRole==='assault' && i === 0 && wave >= fdOptionNumber('squadLeaderMinimumSize', 3) &&
           Math.random() < fdOptionNumber('squadLeaderChance', 0.35)) {
         var leaders = fdConfig.squadLeaderEntities || ['crusty_chunks:commander', 'crusty_chunks:scout']
@@ -1858,7 +2077,7 @@ function fdUpdateLocalFront(server) {
       if(spawnedAt) {
         parentCounts[parentKey]++
         if(guaranteedMortar)missingSiegeMortars--
-        if(heavyArmor)parentHeavyCounts[parentKey]++
+        if(heavyArmor){parentHeavyCounts[parentKey]++;breakthroughHeavyMissing=false}
         if(ciwsSupport)parentCiwsCounts[parentKey]++
       }
       if (rareSupport && spawnedAt) {
@@ -1910,10 +2129,12 @@ ServerEvents.tick(event => {
   if (fdTick % FD_CHECK_TICKS !== 0) return
 
   var server = event.server
+  fdBreakthroughTick(server)
   // 0% freezes strategic borders without freezing battles. Other presets
   // consume the expansion clock proportionally and persist with the world.
   fdExpansionClock -= FD_CHECK_TICKS * fdWarPace(event.server) / 100
   if (fdExpansionClock <= 0) {
+    fdBreakthroughMaybeAuto(server)
     fdStrategicExpansion(server)
     fdExpansionClock = Number(fdConfig.expansionIntervalMinutes) * 60 * 20
   }
@@ -1932,6 +2153,7 @@ EntityEvents.death(event => {
   var sx = fdSX(entity.x)
   var sz = fdSZ(entity.z)
   if (!fdAllowedSector(sx, sz)) return
+  fdBreakthroughRecordLoss(event.server,entity)
 
   var player = event.source && event.source.player ? event.source.player : null
   var loss = Number(fdConfig.controlLossPerRobotKill)

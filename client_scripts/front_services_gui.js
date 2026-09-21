@@ -21,6 +21,9 @@ var fsText={
  uk:{mail:'ПОШТА',profile:'РП-ПРОФІЛЬ',missions:'СПЕЦОПЕРАЦІЇ',back:'Штаб',save:'Зберегти',role:'Посада (лише РП)',callsign:'Позивний',flag:'Емблема / символ',read:'Прочитано',refresh:'Оновити',cancel:'Скасувати',mortar:'Мінометник',depot:'Постачальник',headquarters:'Командир',empty:'Немає активного завдання',defence:'Останній облік оборони',soldiers:'солдатів',vehicles:'техніка',advance:'Просування противника',liberated:'Зону звільнено',mission_mortar:'Мінометну підтримку послаблено',mission_depot:'Поповнення затримано',mission_headquarters:'Наступ затримано'},
  en:{mail:'MAIL',profile:'RP PROFILE',missions:'OPERATIONS',back:'HQ',save:'Save',role:'Role (RP only)',callsign:'Callsign',flag:'Emblem / symbol',read:'Mark read',refresh:'Refresh',cancel:'Cancel',mortar:'Mortar operator',depot:'Supply unit',headquarters:'Commander',empty:'No active operation',defence:'Last defence census',soldiers:'soldiers',vehicles:'vehicles',advance:'Enemy advance',liberated:'Zone liberated',mission_mortar:'Mortar support reduced',mission_depot:'Reinforcements delayed',mission_headquarters:'Advance delayed'}
 }
+fsText.ru.breakthrough_prepare='Обнаружена подготовка прорыва';fsText.ru.breakthrough_assault='Начался прорыв';fsText.ru.breakthrough_success='Прорыв завершён';fsText.ru.breakthrough_failed='Прорыв сорван'
+fsText.uk.breakthrough_prepare='Виявлено підготовку прориву';fsText.uk.breakthrough_assault='Почався прорив';fsText.uk.breakthrough_success='Прорив завершено';fsText.uk.breakthrough_failed='Прорив зірвано'
+fsText.en.breakthrough_prepare='Breakthrough preparations detected';fsText.en.breakthrough_assault='Breakthrough under way';fsText.en.breakthrough_success='Breakthrough concluded';fsText.en.breakthrough_failed='Breakthrough defeated'
 function fsRequest(action,tab){fsPacketOnce('front:services_ui_request',{action:action,tab:tab || action})}
 NetworkEvents.dataReceived('front:services_data',event=>{
  var d=event.data;fsData={};
