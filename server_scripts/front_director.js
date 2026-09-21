@@ -163,6 +163,8 @@ var fdCombatTick = 0
 var fdSharedIntel = null
 var fdTrackedRobots = []
 var fdTrackedSem = []
+var fdTrackedVehicles = []
+var fdVehicleDamageState = {}
 var fdEntityScanTick = -999999
 var fdCombatCursor = 0
 var fdTerrainCache = {}
@@ -279,7 +281,8 @@ function fdLoadConfig(server) {
     if(!isFinite(value)||value<range[0]||value>range[1])throw new Error('Invalid '+name+': '+fdConfig[name])
   })
   var optionalNumericRules={siegeMortarMinimum:[0,4],settlementCivilianMinimum:[1,64],
-    backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64],
+    backgroundSectorsPerCycle:[0,16],rememberedDefenceMinimum:[1,64],assaultHandoffControl:[1,95],spearheadSlotsPerCycle:[0,32],
+    sweepSquadMinimumSize:[0,12],sweepControlGainPerCheck:[0,10],
     breakthroughPreparationMinutes:[0.25,30],breakthroughAssaultMinutes:[1,60],
     breakthroughCooldownMinutes:[1,240],breakthroughMaxDepth:[1,8],breakthroughLossLimit:[1,128],
     breakthroughControlMultiplier:[1,5],breakthroughCapMultiplier:[1,3],
@@ -288,7 +291,8 @@ function fdLoadConfig(server) {
     riverExpansionFactor:[0,1],riverControlFactor:[0.05,1],
     aiCommandRadiusBlocks:[64,768],aiCommandIntervalTicks:[20,200],aiBatchSize:[1,64],
     aiAdvanceSpeed:[0.5,2],aiRallyEdgeFraction:[0.1,0.45],
-    ciwsChancePerUnit:[0,1],ciwsMinimumControl:[0,100],ciwsMaxPerMajorSector:[0,8]}
+    ciwsChancePerUnit:[0,1],ciwsMinimumControl:[0,100],ciwsMaxPerMajorSector:[0,8],
+    ciwsAircraftDamageMultiplier:[1,5],heavyArmorVehicleDamageMultiplier:[1,5],mortarVehicleDamageMultiplier:[1,5]}
   Object.keys(optionalNumericRules).forEach(name=>{
     if(fdConfig[name]==null)return
     var value=Number(fdConfig[name]),range=optionalNumericRules[name]
@@ -649,6 +653,10 @@ function fdIsSupplied(sx, sz) {
   return fdSupplyCache[fdKey(sx, sz)] === true
 }
 
+function fdAssaultHandoffControl() {
+  return Math.max(1,Math.min(95,fdOptionNumber('assaultHandoffControl',25)))
+}
+
 function fdRememberedResistance(server,sx,sz) {
   fwLoad(server)
   var defence=fwData.defence[fdKey(sx,sz)] || {}
@@ -753,7 +761,7 @@ function fdStrategicExpansion(server) {
     var pair = key.split(',')
     var sx = Number(pair[0])
     var sz = Number(pair[1])
-    if (fdControl(sx, sz) < Number(fdConfig.expansionSourceControl)) return
+    if (fdControl(sx, sz) < fdAssaultHandoffControl()) return
 
     for (var d = 0; d < dirs.length; d++) {
       var nx = sx + dirs[d][0]
@@ -776,11 +784,22 @@ function fdStrategicExpansion(server) {
 
   if (candidates.length === 0) {fdSave(server);return}
   var breakthrough=fdBreakthroughOperation()
-  candidates.sort((a, b) => {
+  var candidateSorter=(a, b) => {
     var aBreak=breakthrough && breakthrough.phase==='assault' && a.sx===Number(breakthrough.sx) && a.sz===Number(breakthrough.sz)?0:1
     var bBreak=breakthrough && breakthrough.phase==='assault' && b.sx===Number(breakthrough.sx) && b.sz===Number(breakthrough.sz)?0:1
     return aBreak-bBreak || Number(a.background)-Number(b.background) || fdNearestOriginDistance(a.sx, a.sz) - fdNearestOriginDistance(b.sx, b.sz)
-  })
+  }
+  candidates.sort(candidateSorter)
+  // One or more strategic slots establish fresh bridgeheads while the rest
+  // finish clearing partially occupied sectors. This creates a real relay:
+  // assault moves on, sweep units consolidate, gendarmerie takes over at 100%.
+  var spearheads=[],consolidation=[]
+  for(var c=0;c<candidates.length;c++) {
+    if(fdControl(candidates[c].sx,candidates[c].sz)<fdAssaultHandoffControl())spearheads.push(candidates[c])
+    else consolidation.push(candidates[c])
+  }
+  var spearheadSlots=Math.max(0,Math.floor(fdOptionNumber('spearheadSlotsPerCycle',1)))
+  candidates=spearheads.slice(0,spearheadSlots).concat(consolidation).concat(spearheads.slice(spearheadSlots))
   var advanceLimit=Math.max(0,Math.floor(Number(fdConfig.sectorsAdvancedPerCycle)))
   var backgroundLimit=Math.max(0,Math.floor(fdOptionNumber('backgroundSectorsPerCycle',fdConfig.sectorsAdvancedPerCycle)))
   var backgroundUsed=0
@@ -974,10 +993,27 @@ function fdNewSquadTag(server,role) {
 }
 
 function fdWaveRole(frontSector,control,missingMortar) {
-  if(!frontSector)return 'gendarmerie'
   if(missingMortar>0)return 'assault'
-  if(control>=fdOptionNumber('sweepControlMinimum',60) && Math.random()<fdOptionNumber('sweepSquadChance',0.30))return 'sweep'
-  return 'assault'
+  // The first wave is still assault at the exact handoff value. On the next
+  // local control tick it moves forward and the sweep detachment replaces it.
+  if(control<=fdAssaultHandoffControl())return 'assault'
+  if(control<100)return 'sweep'
+  return 'gendarmerie'
+}
+
+function fdRefreshOccupationRole(robot) {
+  var role=fdRobotRole(robot),control=fdControl(fdSX(robot.x),fdSZ(robot.z))
+  // Spearhead units keep their assault role and continue into the next sector.
+  // The sweep detachment stays behind and becomes the local gendarmerie at 100%.
+  if(role==='sweep' && control>=100) {
+    try {robot.removeTag('fd_role_sweep');robot.addTag('fd_role_gendarmerie')}catch(ignored){}
+    return 'gendarmerie'
+  }
+  if(role==='gendarmerie' && control<100 && control>fdAssaultHandoffControl()) {
+    try {robot.removeTag('fd_role_gendarmerie');robot.addTag('fd_role_sweep')}catch(ignoredToo){}
+    return 'sweep'
+  }
+  return role
 }
 
 function fdBreakthroughAutoEnabled(server) {
@@ -1227,7 +1263,7 @@ function fdAdvanceDestination(level, robot) {
   var sx = fdSX(robot.x)
   var sz = fdSZ(robot.z)
   var currentControl = fdControl(sx, sz)
-  if(currentControl<Number(fdConfig.expansionSourceControl))return fdRallyDestination(level,robot,sx,sz,currentControl)
+  if(currentControl<fdAssaultHandoffControl())return fdRallyDestination(level,robot,sx,sz,currentControl)
   var breakthrough=fdBreakthroughForSector(sx,sz)
 
   var dirs = [[1,0],[-1,0],[0,1],[0,-1]]
@@ -1258,11 +1294,89 @@ function fdAdvanceDestination(level, robot) {
   return best
 }
 
+function fdArrayHas(values,id) {
+  for(var i=0;i<values.length;i++)if(String(values[i])===String(id))return true
+  return false
+}
+
+function fdSbwAircraftEntities() {
+  return fdConfig.sbwAircraftEntities || ['superbwarfare:a_10a','superbwarfare:ah_6','superbwarfare:ju_87','superbwarfare:mi_28','superbwarfare:drone']
+}
+
+function fdSbwArmoredEntities() {
+  return fdConfig.sbwArmoredVehicleEntities || ['superbwarfare:bmp_2','superbwarfare:bradley','superbwarfare:lav_150',
+    'superbwarfare:lav_25','superbwarfare:lav_ad','superbwarfare:m_1a_2','superbwarfare:plz_05','superbwarfare:prism_tank',
+    'superbwarfare:t_90a','superbwarfare:type_63','superbwarfare:ztz_99a']
+}
+
+function fdIsTrackedSbwVehicle(entity) {
+  var id=fdEntityId(entity)
+  return fdArrayHas(fdSbwAircraftEntities(),id) || fdArrayHas(fdSbwArmoredEntities(),id)
+}
+
+function fdVehicleAttacker(vehicle) {
+  var attacker=null
+  try {attacker=vehicle.getLastAttacker()}catch(ignored){}
+  if(attacker==null)return null
+  var id=fdEntityId(attacker)
+  if(id.indexOf('crusty_chunks:')===0)return attacker
+  try {
+    var owner=attacker.getOwner()
+    if(owner!=null && fdEntityId(owner).indexOf('crusty_chunks:')===0)return owner
+  } catch(ignoredOwner) {}
+  try {
+    var ownerField=attacker.owner
+    if(ownerField!=null && fdEntityId(ownerField).indexOf('crusty_chunks:')===0)return ownerField
+  } catch(ignoredField) {}
+  return null
+}
+
+function fdVehicleDamageMultiplier(vehicle,attacker) {
+  var vehicleId=fdEntityId(vehicle),attackerId=fdEntityId(attacker)
+  if(fdArrayHas(fdSbwAircraftEntities(),vehicleId) && attackerId===String(fdConfig.ciwsEntity || 'crusty_chunks:ciws'))
+    return fdOptionNumber('ciwsAircraftDamageMultiplier',2.5)
+  if(!fdArrayHas(fdSbwArmoredEntities(),vehicleId))return 1
+  var antiArmor=fdConfig.antiArmorRobotEntities || ['crusty_chunks:decimator_hull','crusty_chunks:prototype_hull',
+    'crusty_chunks:eradicator_hull','crusty_chunks:decimator_ifv_turret','crusty_chunks:decimator_support_turret',
+    'crusty_chunks:eradicator_tank_turret']
+  if(fdArrayHas(antiArmor,attackerId))return fdOptionNumber('heavyArmorVehicleDamageMultiplier',1.75)
+  if(attackerId==='crusty_chunks:mortarer')return fdOptionNumber('mortarVehicleDamageMultiplier',1.35)
+  return 1
+}
+
+function fdProcessVehicleDamage() {
+  var alive={},next=[]
+  for(var i=0;i<fdTrackedVehicles.length;i++) {
+    var vehicle=fdTrackedVehicles[i]
+    if(vehicle==null || !vehicle.isAlive())continue
+    var key=''
+    try {key=String(vehicle.uuid || vehicle.getUUID())}catch(ignoredUuid){}
+    if(!key || key==='undefined' || key==='null')key=fdEntityId(vehicle)+'@'+Math.floor(vehicle.x)+','+Math.floor(vehicle.z)
+    alive[key]=true;next.push(vehicle)
+    var health=Number(vehicle.getHealth()),stamp=0
+    try {stamp=Number(vehicle.getLastDamageStamp())}catch(ignoredStamp){}
+    var previous=fdVehicleDamageState[key]
+    if(previous && health<Number(previous.health) && stamp!==Number(previous.stamp)) {
+      var attacker=fdVehicleAttacker(vehicle),multiplier=attacker==null?1:fdVehicleDamageMultiplier(vehicle,attacker)
+      if(multiplier>1) {
+        var extra=(Number(previous.health)-health)*(multiplier-1)
+        if(extra>0) {
+          try {vehicle.setHealth(Math.max(0,health-extra));health=Number(vehicle.getHealth())}catch(ignoredDamage){}
+        }
+      }
+    }
+    fdVehicleDamageState[key]={health:health,stamp:stamp}
+  }
+  fdTrackedVehicles=next
+  Object.keys(fdVehicleDamageState).forEach(key=>{if(!alive[key])delete fdVehicleDamageState[key]})
+}
+
 function fdCombatNetwork(server) {
   var level = fdWorld(server)
   if (fdCombatTick - fdEntityScanTick >= FD_ENTITY_SCAN_INTERVAL) {
     fdTrackedRobots = []
     fdTrackedSem = []
+    fdTrackedVehicles = []
     fdSettlementCivilians = {}
     var iterator = level.getAllEntities().iterator()
     fwScanBegin()
@@ -1270,12 +1384,14 @@ function fdCombatNetwork(server) {
       var scannedEntity = iterator.next()
       if (!scannedEntity.isAlive()) continue
       fwScanEntity(scannedEntity)
+      if(fdIsTrackedSbwVehicle(scannedEntity))fdTrackedVehicles.push(scannedEntity)
       if (fdIsCivilianEntity(scannedEntity)) {
         var civilianKey=fdMajorKey(fdSX(scannedEntity.x),fdSZ(scannedEntity.z))
         fdSettlementCivilians[civilianKey]=Number(fdSettlementCivilians[civilianKey] || 0)+1
       }
       if (fdIsRobot(scannedEntity) && scannedEntity.getTags().contains('fd_robot')) {
         fdEnsureRobotRole(scannedEntity)
+        fdRefreshOccupationRole(scannedEntity)
         if(fdIsHeavyArmorType(fdEntityId(scannedEntity)) && !scannedEntity.getTags().contains('fd_heavy_assembled'))fdAssembleHeavy(level,scannedEntity)
         fdTrackedRobots.push(scannedEntity)
       }
@@ -1285,6 +1401,8 @@ function fdCombatNetwork(server) {
     fdEntityScanTick = fdCombatTick
     if (fdCombatCursor >= fdTrackedRobots.length) fdCombatCursor = 0
   }
+
+  fdProcessVehicleDamage()
 
   var robots = fdTrackedRobots
   var semSoldiers = fdTrackedSem
@@ -1922,6 +2040,8 @@ function fdResetWar(context) {
   fdOpsDirty = true
   fdTrackedRobots = []
   fdTrackedSem = []
+  fdTrackedVehicles = []
+  fdVehicleDamageState = {}
   fdSettlementCivilians = {}
   fdCombatCursor = 0
   fdEntityScanTick = fdCombatTick
@@ -1992,12 +2112,16 @@ function fdUpdateLocalFront(server) {
 
     var robots = fdCount(server, fdRobotSelector(activeSector.sx, activeSector.sz))
     var defenders = fdDefenderCount(server, activeSector.sx, activeSector.sz)
+    var sweepUnits=fdCount(server,`@e[tag=fd_robot,tag=fd_role_sweep,${fdSectorBox(activeSector.sx,activeSector.sz)}]`)
 
     if (defenders > 0 && robots === 0 && control > 0) {
       var recovery = Number(fdConfig.defenderRecoveryPerCheck) * Math.min(defenders, Number(fdConfig.resistanceCap))
       fdSetControl(activeSector.sx, activeSector.sz, control - recovery)
-    } else if (defenders === 0 && control > 0 && fdNeighborHasControl(activeSector.sx, activeSector.sz, Number(fdConfig.expansionSourceControl))) {
-      fdSetControl(activeSector.sx, activeSector.sz, control + Number(fdConfig.unopposedGainPerCheck))
+    } else if (defenders === 0 && control > 0 && fdNeighborHasControl(activeSector.sx, activeSector.sz, fdAssaultHandoffControl())) {
+      var occupationGain=Number(fdConfig.unopposedGainPerCheck)
+      if(control>fdAssaultHandoffControl() && control<100 && sweepUnits>0)
+        occupationGain+=Math.min(sweepUnits,fdOptionNumber('sweepSquadMinimumSize',3))*fdOptionNumber('sweepControlGainPerCheck',0.5)
+      fdSetControl(activeSector.sx, activeSector.sz, control + occupationGain)
     }
 
     var updated = fdControl(activeSector.sx, activeSector.sz)
@@ -2008,33 +2132,43 @@ function fdUpdateLocalFront(server) {
     var settlementSector = citySector || fdIsSettlementSector(level, activeSector.sx, activeSector.sz)
     var breakthrough=fdBreakthroughForSector(activeSector.sx,activeSector.sz)
     var breakthroughSettings=breakthrough?fdBreakthroughSettings(breakthrough.strength):null
+    var waveRole=breakthrough?'assault':fdWaveRole(frontSector,updated,0)
     var mortarSuppressed = fwMissionEffect(server, fdKey(activeSector.sx,activeSector.sz), 'mortar')
-    var requiredMortars = frontSector && settlementSector && !mortarSuppressed ? Math.floor(fdOptionNumber('siegeMortarMinimum',1)) : 0
+    var requiredMortars = frontSector && updated<100 && settlementSector && !mortarSuppressed ? Math.floor(fdOptionNumber('siegeMortarMinimum',1)) : 0
     var mortarCount = requiredMortars > 0 ? fdCount(server,`@e[type=crusty_chunks:mortarer,tag=fd_robot,x=${Number(parentPair[0])*majorSize},y=-64,z=${Number(parentPair[1])*majorSize},dx=${majorSize-1},dy=384,dz=${majorSize-1}]`) : 0
     var missingSiegeMortars = Math.max(0,requiredMortars-mortarCount)
+    if(missingSiegeMortars>0)waveRole='assault'
+    var roleCount=0,roleMinimum=0
+    if(waveRole==='sweep') {
+      roleCount=sweepUnits;roleMinimum=Math.floor(fdOptionNumber('sweepSquadMinimumSize',3))
+    } else if(waveRole==='gendarmerie') {
+      roleCount=fdCount(server,`@e[tag=fd_robot,tag=fd_role_gendarmerie,${fdSectorBox(activeSector.sx,activeSector.sz)}]`)+sweepUnits
+      roleMinimum=Math.floor(fdOptionNumber('gendarmerieSquadMinimumSize',2))
+    }
+    var missingOccupation=Math.max(0,roleMinimum-roleCount)
     var cityMultiplier = citySector ? fdOptionNumber('cityRobotMultiplier', 1.8) : 1.0
     var resistanceBonus = Math.min(Number(fdConfig.resistanceCap), defenders) * Number(fdConfig.extraRobotsPerDefender)
     var frontBaseCap = fdOptionNumber('frontRobotCapPerSector', fdConfig.baseRobotCapPerSector)
     var rearBaseCap = fdOptionNumber('rearGarrisonCapPerSector', 8)
-    var selectedBaseCap = frontSector ? frontBaseCap : rearBaseCap
+    var selectedBaseCap = waveRole==='gendarmerie' ? rearBaseCap : frontBaseCap
     var absoluteCap=Number(fdConfig.absoluteRobotCapPerSector)
     if(breakthroughSettings) {
       var phaseCapMultiplier=breakthrough.phase==='assault'?breakthroughSettings.capMultiplier:1+(breakthroughSettings.capMultiplier-1)*0.5
       selectedBaseCap*=phaseCapMultiplier
       absoluteCap+=breakthroughSettings.absoluteBonus
     }
-    var cap = Math.min(absoluteCap+missingSiegeMortars,
+    var cap = Math.min(absoluteCap+missingSiegeMortars+missingOccupation,
       Math.round(selectedBaseCap * strength * cityMultiplier + (frontSector ? resistanceBonus : 0)))
     if(missingSiegeMortars>0)cap=Math.max(cap,Math.min(robots+missingSiegeMortars,absoluteCap+missingSiegeMortars))
+    if(missingOccupation>0)cap=Math.max(cap,Math.min(robots+missingOccupation,absoluteCap+missingOccupation))
 
     if (robots >= cap) return
-    var selectedBatch = frontSector ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) :
+    var selectedBatch = waveRole!=='gendarmerie' ? fdOptionNumber('frontSpawnBatch', fdConfig.spawnBatch) :
       Math.max(fdOptionNumber('gendarmerieSquadMinimumSize',2),fdOptionNumber('rearSpawnBatch',2))
     if(breakthroughSettings)selectedBatch+=breakthrough.phase==='assault'?breakthroughSettings.extraBatch:Math.max(1,Math.floor(breakthroughSettings.extraBatch/2))
     var wave = Math.min(selectedBatch, cap - robots,
-      Math.max(0,absoluteCap+missingSiegeMortars-parentCounts[parentKey]))
+      Math.max(0,absoluteCap+missingSiegeMortars+missingOccupation-parentCounts[parentKey]))
     if(wave<=0) return
-    var waveRole=breakthrough?'assault':fdWaveRole(frontSector,updated,missingSiegeMortars)
     var squadTag=fdNewSquadTag(server,waveRole)
     var squadAnchor = null
     var rarePresent = fdCount(server, `@e[tag=fd_rare_support,${fdSectorBox(activeSector.sx, activeSector.sz)}]`) > 0
@@ -2176,6 +2310,7 @@ EntityEvents.spawned(event => {
   if (!fdConfig || !fdConfig.enabled) return
   var entity = event.entity
   var id = fdEntityId(entity)
+  if(fdIsTrackedSbwVehicle(entity))fdTrackedVehicles.push(entity)
   if (id.indexOf('simpleenemymod:') === 0) {
     fdTrackedSem.push(entity)
     return
